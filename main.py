@@ -1,4 +1,98 @@
-import torch, math
+import math
+import itertools
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+
+from dataclasses import dataclass, field
+
+@dataclass
+class EpisodeTracker:
+    t: list = field(default_factory=list)
+    phase: list = field(default_factory=list)  # 'C' or 'A'
+    mid: list = field(default_factory=list)
+    H_cl: list = field(default_factory=list)
+    inv: list = field(default_factory=list)
+    depth_ask: list = field(default_factory=list)
+    depth_bid: list = field(default_factory=list)
+    top_ask: list = field(default_factory=list)
+    top_bid: list = field(default_factory=list)
+    N_plus: list = field(default_factory=list)
+    N_minus: list = field(default_factory=list)
+    last_exec: list = field(default_factory=list)
+    reward: list = field(default_factory=list)
+    cum_reward: list = field(default_factory=list)
+    act_v: list = field(default_factory=list)        # CLOB actions
+    act_delta: list = field(default_factory=list)
+    act_K: list = field(default_factory=list)        # Auction actions
+    act_S: list = field(default_factory=list)
+
+def plot_episode(tr: EpisodeTracker, ep: int, tau_op: int, tau_cl: int, save_path=None):
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    T = np.arange(len(tr.t))
+    fig, axs = plt.subplots(3, 3, figsize=(12, 9))
+
+    # 1) prices
+    axs[0,0].plot(tr.t, tr.mid, label='mid')
+    axs[0,0].plot(tr.t, tr.H_cl, label='H_cl', alpha=0.8)
+    axs[0,0].axvline(tau_op, ls='--', lw=0.8, color='k')
+    axs[0,0].set_title('Mid vs H_cl'); axs[0,0].legend()
+
+    # 2) inventory & exec
+    axs[0,1].plot(tr.t, tr.inv, label='inventory')
+    axs[0,1].axvline(tau_op, ls='--', lw=0.8, color='k'); axs[0,1].legend()
+    axs[0,1].set_title('Inventory')
+
+    axs[0,2].plot(tr.t, tr.last_exec)
+    axs[0,2].axvline(tau_op, ls='--', lw=0.8, color='k')
+    axs[0,2].set_title('Executed (this step)')
+
+    # 3) depths & top-of-book vols
+    axs[1,0].plot(tr.t, tr.depth_ask, label='ask depth')
+    axs[1,0].plot(tr.t, tr.depth_bid, label='bid depth')
+    axs[1,0].axvline(tau_op, ls='--', lw=0.8, color='k'); axs[1,0].legend()
+    axs[1,0].set_title('Depths')
+
+    axs[1,1].plot(tr.t, tr.top_ask, label='top ask vol')
+    axs[1,1].plot(tr.t, tr.top_bid, label='top bid vol')
+    axs[1,1].axvline(tau_op, ls='--', lw=0.8, color='k'); axs[1,1].legend()
+    axs[1,1].set_title('Top-of-book volumes')
+
+    axs[1,2].plot(tr.t, tr.N_plus, label='N+ (sell MOs)')
+    axs[1,2].plot(tr.t, tr.N_minus, label='N- (buy MOs)')
+    axs[1,2].axvline(tau_op, ls='--', lw=0.8, color='k'); axs[1,2].legend()
+    axs[1,2].set_title('Auction MO counters')
+
+    # 4) rewards
+    axs[2,0].plot(tr.t, tr.reward); axs[2,0].set_title('Reward per step')
+    axs[2,0].axvline(tau_op, ls='--', lw=0.8, color='k')
+
+    axs[2,1].plot(tr.t, tr.cum_reward); axs[2,1].set_title('Cumulative reward')
+    axs[2,1].axvline(tau_op, ls='--', lw=0.8, color='k')
+
+    # 5) actions
+    # show CLOB actions (v, Δ) and Auction (K, S) on same axis with NaNs to break lines
+    axs[2,2].plot(tr.t, tr.act_v, label='CLOB v')
+    axs[2,2].plot(tr.t, tr.act_delta, label='CLOB Δ')
+    axs[2,2].plot(tr.t, tr.act_K, label='Auct K')
+    axs[2,2].plot(tr.t, tr.act_S, label='Auct S')
+    axs[2,2].axvline(tau_op, ls='--', lw=0.8, color='k')
+    axs[2,2].legend(); axs[2,2].set_title('Actions')
+
+    for ax in axs.flat:
+        ax.grid(True, alpha=0.25)
+
+    fig.suptitle(f"Episode {ep} timeline", y=0.995)
+    fig.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+    plt.show()
 
 class MarketEmulator:
     def __init__(self, tau_op=10, tau_cl=15, I=10000, V=5000, L=10, Lc=5, La=5,
@@ -6,18 +100,6 @@ class MarketEmulator:
                  v_m=1000, pareto_gamma=2.0, poisson_rate=0.5, sigma_mid=1.0, seed=None):
         """
         Initialize the market emulator with given parameters.
-        - tau_op, tau_cl: start and end times of the auction (continuous phase is [0, tau_op-1]).
-        - I: initial inventory (and bound).
-        - V: volume bound for any single order.
-        - L: bound on number of market orders (takers) on each side.
-        - Lc: order book depth (number of price levels with initial volume).
-        - La: max number of exogenous supply functions in auction.
-        - lambda_param, kappa, q, d: reward penalty parameters as defined in the model.
-        - gamma: smoothing parameter for clearing price updates in continuous phase.
-        - v_m, pareto_gamma: parameters for Pareto distribution of auction market order volumes.
-        - poisson_rate: Poisson process rate for market order arrivals in continuous phase.
-        - sigma_mid: volatility scale for mid-price Brownian motion.
-        - seed: random seed for reproducibility.
         """
         if seed is not None:
             torch.manual_seed(seed)
@@ -54,8 +136,7 @@ class MarketEmulator:
         self.H_cl = self.mid_price  # initialize hypothetical clearing price
         # Initialize order book volumes for continuous phase
         # Sample best level volume from Beta(0.5, 0.5) scaled to [1000, 5000]
-        beta_dist = torch.distributions.Beta(torch.tensor([0.5]), torch.tensor([0.5]))
-        V1 = 1000 * (4 * beta_dist.sample().item() + 1)
+        V1 = 1000.0 * (4.0 * np.random.beta(0.5, 0.5) + 1.0)
         V1 = float(min(V1, self.V_max))
         # Geometric volume decay for deeper levels
         self.ask_volumes = [V1 * (0.5 ** j) for j in range(self.Lc)]
@@ -101,7 +182,6 @@ class MarketEmulator:
         X8 = self.N_minus if in_auction else 0
         # X^9: Agent's cancellation status vector theta_t (length tau_cl+1)
         if in_auction:
-            # theta_t^(s) = 1 if order at time s (tau_op <= s < t) was canceled by now
             theta = []
             for s in range(self.tau_op, self.tau_cl):
                 if self.agent_orders_K[s] != 0 or self.agent_orders_S[s] != 0:
@@ -163,7 +243,7 @@ class MarketEmulator:
             else:
                 X16.append(0.0)
                 X17.append(0.0)
-        # Return state as a dictionary (could also be a concatenated list/tensor as needed)
+        # Return state
         return {
             'X1': X1, 'X2': X2, 'X3': X3, 'X4': X4, 'X5': X5,
             'X6': X6, 'X7': X7, 'X8': X8, 'X9': X9, 'X10': X10,
@@ -180,324 +260,248 @@ class MarketEmulator:
         # Helper function: positive part
         def f(x): return x if x > 0 else 0
         
-        # Continuous phase step
+        # -----------------------------
+        # Continuous (CLOB) phase step
+        # -----------------------------
         if self.phase == 'continuous':
-            # Expect action = (v, delta) for volume and price offset (in ticks)
+            # Expect action = (v, delta) for volume and price offset (in ticks, delta>=0)
             v, delta = action
             v = float(v); delta = float(delta)
             # Ensure action is admissible
             if v > self.inventory: 
                 v = self.inventory
+            v = max(0.0, min(v, self.V_max))
             # If an old order is still active (leftover), cancel it (no cost in continuous)
-            if self.agent_active_order_cont:
-                self.agent_active_order_cont = None
-            # Determine agent's limit price and tick level
-            agent_price = self.mid_price + delta * 1.0  # alpha = 1 for tick size
-            # Prevent placing sell order below current best bid (approximate by mid as reference)
-            if agent_price < self.mid_price:
-                agent_price = self.mid_price
-            # Determine agent's price level index relative to mid (0 = at mid)
-            j_agent = 0
-            if agent_price > self.mid_price:
-                # number of ticks above mid (assuming 1 tick = 1 price unit)
-                j_agent = math.floor((agent_price - self.mid_price) + 0.5)
+            self.agent_active_order_cont = None
+
+            # Clamp level into book and snap price to tick
+            j_agent = int(max(0, min(self.Lc - 1, math.floor(delta))))
+            agent_price = self.mid_price + float(j_agent)  # 1 tick = 1.0
+
             # Place agent's order in the OB
-            self.agent_active_order_cont = {'level': j_agent, 'price': agent_price, 'volume': v}
+            if v > 0 and j_agent < self.Lc:
+                self.agent_active_order_cont = {'level': j_agent, 'price': agent_price, 'volume': v}
             
             # Simulate random market order arrivals until next agent action time
             last_time = self.current_time
-            next_allowed_time = math.floor(last_time) + 1
-            if next_allowed_time > self.tau_op - 1:
-                next_allowed_time = self.tau_op - 1
+            # Next discrete decision boundary (end of second or end of continuous)
+            next_allowed_time = min(math.floor(last_time) + 1, self.tau_op - 1)
             target_time = float(next_allowed_time)
-            arrived_buy = False  # at least one buy MO arrived
-            arrived_sell = False  # at least one sell MO arrived
+
             executed_vol = 0.0   # total executed volume of agent's order in this interval
-            
-            # Sample next arrival times for buy and sell Poisson processes
-            next_buy_time = last_time + torch.distributions.Exponential(self.poisson_rate).sample().item()
-            next_sell_time = last_time + torch.distributions.Exponential(self.poisson_rate).sample().item()
-            
-            # Define event processing for a buy market order (arriving at next_buy_time)
+
+            # Initialize next arrival times (independent Poissons)
+            # Use NumPy exponentials for speed: scale=1/lambda
+            next_buy_time = last_time + np.random.exponential(scale=1.0 / self.poisson_rate)
+            next_sell_time = last_time + np.random.exponential(scale=1.0 / self.poisson_rate)
+
+            # Define event processing for a buy market order (consumes ask side)
             def process_buy_order(volume):
                 nonlocal executed_vol
-                remain = volume
-                # 1. Consume ask-side volumes up to agent's price level
-                for j in range(min(j_agent, self.Lc)):
+                remain = float(volume)
+
+                # 1) Consume ask-side volumes up to agent's level
+                upto = min(j_agent, self.Lc)
+                for j in range(upto):
                     if remain <= 0:
                         break
-                    if self.ask_volumes[j] <= 0:
+                    lvl = self.ask_volumes[j]
+                    if lvl <= 0:
                         continue
-                    if remain >= self.ask_volumes[j]:
-                        # consume entire level j
-                        remain -= self.ask_volumes[j]
-                        self.ask_volumes[j] = 0.0
-                    else:
-                        # partial fill at level j
-                        self.ask_volumes[j] -= remain
-                        remain = 0
-                        break
-                # 2. If buy volume still remains, it will reach agent's level
-                if remain > 0 and self.agent_active_order_cont:
-                    # Execute agent's order at j_agent with priority
+                    take = min(remain, lvl)
+                    self.ask_volumes[j] -= take
+                    remain -= take
+
+                # 2) Agent priority at j_agent
+                if remain > 0 and self.agent_active_order_cont and j_agent < self.Lc:
                     vol_agent = self.agent_active_order_cont['volume']
-                    if remain >= vol_agent:
-                        # entire agent order executed
-                        executed_vol += vol_agent
-                        self.inventory -= vol_agent
-                        remain -= vol_agent
-                        # agent order fully filled, remove it
-                        self.agent_active_order_cont = None
-                    else:
-                        # agent order partially executed
-                        executed_vol += remain
-                        self.inventory -= remain
-                        self.agent_active_order_cont['volume'] = vol_agent - remain
-                        remain = 0
-                # 3. If buy volume remains after agent (or if agent had no order or was filled), consume exogenous vol at agent level and deeper
+                    take = min(remain, vol_agent)
+                    if take > 0:
+                        executed_vol += take
+                        self.inventory -= take
+                        self.agent_active_order_cont['volume'] = vol_agent - take
+                        remain -= take
+                        if self.agent_active_order_cont['volume'] <= 1e-9:
+                            self.agent_active_order_cont = None
+
+                # 3) Exogenous volume at j_agent and deeper
                 if remain > 0:
-                    # Consume exogenous volume at agent's price level
                     if j_agent < self.Lc:
-                        if remain >= self.ask_volumes[j_agent]:
-                            remain -= self.ask_volumes[j_agent]
-                            self.ask_volumes[j_agent] = 0.0
-                        else:
-                            self.ask_volumes[j_agent] -= remain
-                            remain = 0
-                    # Continue to deeper levels j > j_agent
+                        lvl = self.ask_volumes[j_agent]
+                        take = min(remain, lvl)
+                        self.ask_volumes[j_agent] -= take
+                        remain -= take
                     j = j_agent + 1
                     while remain > 0 and j < self.Lc:
-                        if self.ask_volumes[j] <= 0:
-                            j += 1
-                            continue
-                        if remain >= self.ask_volumes[j]:
-                            remain -= self.ask_volumes[j]
-                            self.ask_volumes[j] = 0.0
-                        else:
-                            self.ask_volumes[j] -= remain
-                            remain = 0
+                        lvl = self.ask_volumes[j]
+                        take = min(remain, lvl)
+                        self.ask_volumes[j] -= take
+                        remain -= take
                         j += 1
             
-            # Define event processing for a sell market order
+            # Define event processing for a sell market order (consumes bid side)
             def process_sell_order(volume):
-                remain = volume
-                # Consume bid-side volumes from best bid downward
+                remain = float(volume)
                 for j in range(self.Lc):
                     if remain <= 0:
                         break
-                    if self.bid_volumes[j] <= 0:
+                    lvl = self.bid_volumes[j]
+                    if lvl <= 0:
                         continue
-                    if remain >= self.bid_volumes[j]:
-                        remain -= self.bid_volumes[j]
-                        self.bid_volumes[j] = 0.0
-                    else:
-                        self.bid_volumes[j] -= remain
-                        remain = 0
-                        break
+                    take = min(remain, lvl)
+                    self.bid_volumes[j] -= take
+                    remain -= take
             
             current_time = last_time
-            # Phase 1: simulate events up to the discrete target_time
+
+            # Simulate events up to the decision boundary
             while min(next_buy_time, next_sell_time) <= target_time:
                 if next_buy_time <= next_sell_time:
-                    # Buy order arrives
                     current_time = next_buy_time
-                    arrived_buy = True
-                    process_buy_order(volume=min(5000, self.V_max))  # each MO volume = 5000 (capped by V_max)
-                    # sample next arrival on buy side
-                    next_buy_time = current_time + torch.distributions.Exponential(self.poisson_rate).sample().item()
+                    process_buy_order(volume=min(5000.0, self.V_max))
+                    next_buy_time = current_time + np.random.exponential(scale=1.0 / self.poisson_rate)
                 else:
-                    # Sell order arrives
                     current_time = next_sell_time
-                    arrived_sell = True
-                    process_sell_order(volume=min(5000, self.V_max))
-                    next_sell_time = current_time + torch.distributions.Exponential(self.poisson_rate).sample().item()
-            
-            # Phase 2: if one side had no arrivals by target_time, wait for the first arrival(s) after target
+                    process_sell_order(volume=min(5000.0, self.V_max))
+                    next_sell_time = current_time + np.random.exponential(scale=1.0 / self.poisson_rate)
+
+            # Decide at the boundary (always advance at least to target_time)
             next_decision_time = target_time
-            if not arrived_buy or not arrived_sell:
-                # Extend simulation beyond target_time
-                # Determine which sides are missing
-                missing_buy = not arrived_buy
-                missing_sell = not arrived_sell
-                # If both missing, we need two arrivals (one on each side) after target
-                if missing_buy and missing_sell:
-                    # Wait for first arrival after target (whichever side)
-                    first_arrival_time = min(next_buy_time, next_sell_time)
-                    if first_arrival_time <= self.tau_op - 1:
-                        if next_buy_time <= next_sell_time:
-                            current_time = next_buy_time
-                            arrived_buy = True
-                            process_buy_order(volume=min(5000, self.V_max))
-                            next_buy_time = current_time + torch.distributions.Exponential(self.poisson_rate).sample().item()
-                        else:
-                            current_time = next_sell_time
-                            arrived_sell = True
-                            process_sell_order(volume=min(5000, self.V_max))
-                            next_sell_time = current_time + torch.distributions.Exponential(self.poisson_rate).sample().item()
-                    # Now one side arrived; the other is still missing
-                    missing_buy = not arrived_buy
-                    missing_sell = not arrived_sell
-                # Now handle the remaining one missing side (if any), waiting for its first arrival
-                if missing_buy and arrived_sell:
-                    # Wait for first buy arrival after target
-                    if next_buy_time <= self.tau_op - 1:
-                        current_time = next_buy_time
-                        arrived_buy = True
-                        process_buy_order(volume=min(5000, self.V_max))
-                        next_buy_time = current_time + torch.distributions.Exponential(self.poisson_rate).sample().item()
-                elif missing_sell and arrived_buy:
-                    # Wait for first sell arrival after target
-                    if next_sell_time <= self.tau_op - 1:
-                        current_time = next_sell_time
-                        arrived_sell = True
-                        process_sell_order(volume=min(5000, self.V_max))
-                        next_sell_time = current_time + torch.distributions.Exponential(self.poisson_rate).sample().item()
-                # The next decision time is the time of the last arrival (or tau_op-1 if no arrival occurred by then)
-                next_decision_time = min(current_time, self.tau_op - 1)
-            
+
             # Update order book depths after processing events
             self.depth_ask = next((j+1 for j,v in enumerate(self.ask_volumes) if v <= 1e-6), self.Lc)
             self.depth_bid = next((j+1 for j,v in enumerate(self.bid_volumes) if v <= 1e-6), self.Lc)
+
             # Update hypothetical clearing price H_t^cl (smoothly toward mid-price)
-            tilde_price = self.mid_price
-            self.H_cl += self.gamma * (tilde_price - self.H_cl)
+            self.H_cl += self.gamma * (self.mid_price - self.H_cl)
+
             # Compute reward for this step
             S_submit = agent_price  # agent's limit price
             E_t = executed_vol       # executed volume of agent's order
             reward = S_submit * E_t * f(1 - self.kappa * f(self.H_cl - S_submit))
+
             # Update state variables
             self.last_executed = E_t
-            self.inventory = max(0.0, self.inventory)  # inventory cannot go negative
+            self.inventory = float(np.clip(self.inventory, -self.I_max, self.I_max))
+
             # Advance current time to the next decision time
+            dt = max(0.0, next_decision_time - last_time)
             self.current_time = float(next_decision_time)
             self.last_action_time = float(next_decision_time)
+
             # Remove any remaining agent order (it will be replaced or canceled at next action)
-            if self.agent_active_order_cont:
-                self.agent_active_order_cont = None
+            self.agent_active_order_cont = None
+
             # Update mid-price via Brownian motion for the time interval
-            dt = max(0.0, self.current_time - last_time)
             if dt > 0:
-                price_change = torch.randn(1).item() * self.sigma_mid * math.sqrt(dt)
+                price_change = float(np.random.normal(loc=0.0, scale=self.sigma_mid * math.sqrt(dt)))
                 self.mid_price += price_change
+
             # Check for transition to auction phase
             done = False
             if self.current_time >= self.tau_op - 1:
-                # If we've reached the last continuous time, transition to auction
+                # Transition to auction
                 self.phase = 'auction'
-                # Start auction at time tau_op
                 self.current_time = float(self.tau_op)
-                # Reset auction-specific state
                 self.N_plus = 0; self.N_minus = 0
                 self.market_sell_volumes = [0.0] * self.L_max
                 self.market_buy_volumes = [0.0] * self.L_max
                 self.active_supply = []
-            # Return next state
+
             next_state = self._get_state()
             return next_state, reward, done
         
+        # -----------------------------
         # Auction phase step
+        # -----------------------------
         elif self.phase == 'auction':
-            # Expect action = (K_t^a, S_t^a, c_t) in the auction
+            # Expect action = (K_t^a, S_t^a, c_t)
             K_a, S_a, c_t = action
             K_a = float(K_a); S_a = float(S_a)
-            # Current auction time (integer)
             t = int(self.current_time)
             done = False
+
             # 1. Process exogenous arrivals/cancellations at time t
             # (a) Exogenous limit (supply) orders
-            # Randomly add a new supply order with some probability
-            if torch.rand(1).item() < 0.3 and len(self.active_supply) < self.La:
-                K_new = torch.rand(1).item() * (1 - 0.1) * 50  # e.g. uniform [0,50] as a slope
-                S_new = self.mid_price + (torch.rand(1).item() - 0.5) * 10  # anchor around mid
-                self.active_supply.append((K_new, S_new))
-            # Randomly cancel an existing exogenous supply order
-            if torch.rand(1).item() < 0.2 and self.active_supply:
-                idx = int(torch.randint(0, len(self.active_supply), ()).item())
+            if np.random.rand() < 0.3 and len(self.active_supply) < self.La:
+                K_new = np.random.uniform(0.0, 50.0)
+                S_new = self.mid_price + np.random.uniform(-5.0, 5.0) * 2.0  # width 10 around mid
+                self.active_supply.append((float(K_new), float(S_new)))
+            if np.random.rand() < 0.2 and self.active_supply:
+                idx = int(np.random.randint(0, len(self.active_supply)))
                 self.active_supply.pop(idx)
-            # (b) Exogenous market orders
-            # New market sell order arrival
-            if torch.rand(1).item() < 0.3:
-                U = torch.rand(1).item()
-                vol = self.v_m / ((1 - U) ** (1 / self.pareto_shape))
+            # (b) Exogenous market orders (Pareto capped by V_max)
+            if np.random.rand() < 0.3:
+                U = np.random.rand()
+                vol = self.v_m / ((1.0 - U) ** (1.0 / self.pareto_shape))
                 vol = float(min(vol, self.V_max))
                 if self.N_plus < self.L_max:
                     self.market_sell_volumes[self.N_plus] = vol
-                self.N_plus += 1
-                self.N_plus = min(self.N_plus, self.L_max)
-            # New market buy order arrival
-            if torch.rand(1).item() < 0.3:
-                U = torch.rand(1).item()
-                vol = self.v_m / ((1 - U) ** (1 / self.pareto_shape))
+                self.N_plus = min(self.N_plus + 1, self.L_max)
+            if np.random.rand() < 0.3:
+                U = np.random.rand()
+                vol = self.v_m / ((1.0 - U) ** (1.0 / self.pareto_shape))
                 vol = float(min(vol, self.V_max))
                 if self.N_minus < self.L_max:
                     self.market_buy_volumes[self.N_minus] = vol
-                self.N_minus += 1
-                self.N_minus = min(self.N_minus, self.L_max)
+                self.N_minus = min(self.N_minus + 1, self.L_max)
             # Random cancellation of a pending market order
-            if torch.rand(1).item() < 0.1:
-                if self.N_plus > 0 and torch.rand(1).item() < 0.5:
-                    # cancel a random sell MO
-                    idx = int(torch.randint(0, self.N_plus, ()).item())
+            if np.random.rand() < 0.1:
+                if self.N_plus > 0 and np.random.rand() < 0.5:
+                    idx = int(np.random.randint(0, self.N_plus))
                     self.market_sell_volumes[idx] = 0.0
-                if self.N_minus > 0 and torch.rand(1).item() < 0.5:
-                    # cancel a random buy MO
-                    idx = int(torch.randint(0, self.N_minus, ()).item())
+                if self.N_minus > 0 and np.random.rand() < 0.5:
+                    idx = int(np.random.randint(0, self.N_minus))
                     self.market_buy_volumes[idx] = 0.0
+
             # 2. Apply agent's cancellations c_t
             if isinstance(c_t, torch.Tensor):
                 c_t = c_t.tolist()
-            # c_t is a binary vector length tau_cl (or tau_cl+1) indicating cancellations
             for s in range(self.tau_op, t):
                 if s < len(c_t) and c_t[s] == 1 and self.agent_order_active[s]:
                     self.agent_order_active[s] = False
-            # 3. Agent submits new order (K_t^a, S_t^a) if K_t^a > 0
+
+            # 3. Agent submits new order (K_t^a, S_t^a)
             if K_a > 0:
                 self.agent_orders_K[t] = K_a
                 self.agent_orders_S[t] = S_a
                 self.agent_order_active[t] = True
+
             # 4. Update hypothetical clearing price H_t^cl at time t
-            # Compute total supply slope and intercept from active orders
             total_slope = 0.0
             total_intercept_term = 0.0
-            # Sum exogenous supply functions
             for (K_i, S_i) in self.active_supply:
                 total_slope += K_i
                 total_intercept_term += K_i * S_i
-            # Sum agent's active orders
             for s in range(self.tau_op, t+1):
                 if self.agent_order_active[s]:
                     total_slope += self.agent_orders_K[s]
                     total_intercept_term += self.agent_orders_K[s] * self.agent_orders_S[s]
-            # Sum net market order volume (sell orders contribute supply, buy orders demand)
             net_order_volume = 0.0
             if self.N_plus > 0:
-                net_order_volume += sum(self.market_sell_volumes[:self.N_plus])
+                net_order_volume += float(sum(self.market_sell_volumes[:self.N_plus]))
             if self.N_minus > 0:
-                net_order_volume -= sum(self.market_buy_volumes[:self.N_minus])
-            # Solve for clearing price p where total_slope * p - total_intercept_term + net_order_volume = 0
+                net_order_volume -= float(sum(self.market_buy_volumes[:self.N_minus]))
             if total_slope > 0:
                 self.H_cl = (total_intercept_term - net_order_volume) / total_slope
             else:
-                # No supply (should not happen if agent or others have orders); default to last price
                 self.H_cl = self.mid_price
-            # 5. Compute immediate reward at time t
+
+            # 5. Immediate reward at time t
             reward = 0.0
-            # Market-making revenue component
-            reward += K_a * (self.H_cl - S_a)
-            # Penalty for wrong-side (buy-side) volume
-            reward -= self.q * f(- K_a * (self.H_cl - S_a))
-            # Penalty for cancellations (cost d per canceled order this step)
+            reward += K_a * (self.H_cl - S_a)                          # market-making revenue
+            reward -= self.q * f(- K_a * (self.H_cl - S_a))            # wrong-side penalty
             cancel_count = 0
             if isinstance(c_t, (list, tuple)):
                 cancel_count = sum(1 for s in range(self.tau_op, t) if s < len(c_t) and c_t[s] == 1)
             reward -= self.d * cancel_count
-            # 6. Advance time
-            prev_time = self.current_time
-            self.last_executed = 0.0  # no volume executed immediately in auction
+
+            # 6. Advance time to next auction tick
+            self.last_executed = 0.0
             self.current_time = float(t + 1)
-            # 7. If we have reached the final time, clear the auction
+
+            # 7. Final clearing
             if self.current_time == float(self.tau_cl):
-                # Compute final clearing price S_{tau_cl}^cl with all remaining orders
                 total_slope = 0.0
                 total_intercept_term = 0.0
                 for (K_i, S_i) in self.active_supply:
@@ -509,35 +513,306 @@ class MarketEmulator:
                         total_intercept_term += self.agent_orders_K[s] * self.agent_orders_S[s]
                 net_order_volume = 0.0
                 if self.N_plus > 0:
-                    net_order_volume += sum(self.market_sell_volumes[:self.N_plus])
+                    net_order_volume += float(sum(self.market_sell_volumes[:self.N_plus]))
                 if self.N_minus > 0:
-                    net_order_volume -= sum(self.market_buy_volumes[:self.N_minus])
+                    net_order_volume -= float(sum(self.market_buy_volumes[:self.N_minus]))
                 if total_slope > 0:
                     clearing_price = (total_intercept_term - net_order_volume) / total_slope
                 else:
                     clearing_price = self.H_cl
-                # Calculate executed volume for the agent at final clearing
+
+                # Executed "volume" per your supply function convention
                 executed_final = 0.0
                 for s in range(self.tau_op, self.tau_cl):
                     if self.agent_order_active[s]:
                         executed_final += self.agent_orders_K[s] * (clearing_price - self.agent_orders_S[s])
-                # Update inventory after auction
+
+                # Update inventory and clamp to bounds
                 I_final = self.inventory - executed_final
+                I_final = float(np.clip(I_final, -self.I_max, self.I_max))
                 self.inventory = I_final
-                # Compute terminal reward components
+                self.last_executed = executed_final
+
+                # Terminal reward components
                 terminal_reward = executed_final - self.lambda_param * (abs(I_final) ** 2)
                 wrong_side_sum = 0.0
                 for s in range(self.tau_op, self.tau_cl):
                     if self.agent_order_active[s]:
-                        # f(-K * (S_cl - S_s^a))
                         wrong_side_sum += f(- self.agent_orders_K[s] * (clearing_price - self.agent_orders_S[s]))
                 terminal_reward -= self.q * wrong_side_sum
                 reward += terminal_reward
                 done = True
-            # Return next state
+
             next_state = self._get_state()
             return next_state, reward, done
         
-        # If phase is done (after terminal), do nothing
+        # After terminal
         else:
             return self._get_state(), 0.0, True
+
+# ---------------------
+# Config
+# ---------------------
+
+SEED = 123
+DEVICE = torch.device("cpu")
+
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+
+# Create env (stable-ish defaults)
+env = MarketEmulator(
+    tau_op=12,           # a bit more continuous time
+    tau_cl=18,
+    I=1000,              # smaller inventory bound
+    V=500,               # smaller per-order cap
+    L=8,
+    Lc=6,
+    La=5,
+    lambda_param=1e-4,   # ↓↓↓ shrink terminal inventory penalty
+    kappa=0.1,
+    q=0.01,              # wrong-side penalty softer
+    d=0.01,              # cancellation cost softer
+    gamma=0.5,
+    v_m=200,             # pareto scale smaller
+    pareto_gamma=2.5,    # lighter tails
+    poisson_rate=1.5,    # more arrivals → more fills
+    sigma_mid=0.2,       # calmer mid-price
+    seed=SEED
+)
+
+# Actions: smaller steps
+V_CHOICES = [0, 100, 250, 500]
+DELTA_CHOICES = [0, 1, 2, 3]
+CLOB_ACTIONS = [(v, d) for v, d in itertools.product(V_CHOICES, DELTA_CHOICES)]
+
+K_CHOICES = [0.0, 1.0, 2.5, 5.0, 10.0]
+S_OFFSETS = [-1, 0, 1]
+AUCT_ACTIONS = [(K, off) for K, off in itertools.product(K_CHOICES, S_OFFSETS)]
+
+# Training tweaks
+EPISODES = 30
+LR = 5e-4          # a bit smaller
+GAMMA = 0.995      # slightly longer credit
+
+# ---------------------
+# Feature extraction
+# ---------------------
+def feat_clob(s, env):
+    I_max, Lc, Vmax = env.I_max, env.Lc, env.V_max
+    t_norm = (s['time'] / max(1.0, (env.tau_op - 1))) if s['time'] <= env.tau_op - 1 else 1.0
+    top_ask = (s['X13'][0] / Vmax) if len(s['X13']) > 0 and Vmax > 0 else 0.0
+    top_bid = (s['X14'][0] / Vmax) if len(s['X14']) > 0 and Vmax > 0 else 0.0
+    x_list = [
+        s['X1'] / max(1.0, I_max),
+        s['X3'],
+        s['X10'],
+        s['X4'] / max(1, Lc),
+        s['X5'] / max(1, Lc),
+        top_ask,
+        top_bid,
+        t_norm,
+    ]
+    return torch.tensor(x_list, dtype=torch.float32, device=DEVICE)
+
+def feat_auction(s, env):
+    I_max = env.I_max
+    t_norm = (s['time'] - env.tau_op) / max(1.0, (env.tau_cl - env.tau_op))
+    x_list = [
+        s['X1'] / max(1.0, I_max),
+        s['X3'],
+        s['X10'],
+        s['X6'] / max(1, env.La),
+        s['X7'] / max(1, env.L_max),
+        s['X8'] / max(1, env.L_max),
+        t_norm,
+    ]
+    return torch.tensor(x_list, dtype=torch.float32, device=DEVICE)
+
+# ---------------------
+# Tiny DQNs
+# ---------------------
+class DQN(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(64, out_dim)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+clob_net = DQN(in_dim=8, out_dim=len(CLOB_ACTIONS)).to(DEVICE)
+auct_net = DQN(in_dim=7, out_dim=len(AUCT_ACTIONS)).to(DEVICE)
+opt_clob = optim.Adam(clob_net.parameters(), lr=LR)
+opt_auct = optim.Adam(auct_net.parameters(), lr=LR)
+mse = nn.MSELoss()
+
+# ε-greedy schedule
+def epsilon_by_episode(ep, start=0.9, end=0.1, total=EPISODES):
+    if total <= 1: return end
+    frac = ep / (total - 1)
+    return start + (end - start) * frac
+
+# ---------------------
+# Storage for plots
+# ---------------------
+all_mid_paths = []
+all_step_rewards = []
+all_cum_rewards = []
+final_inventories = []
+
+# ---------------------
+# Training loop
+# ---------------------
+PLOT_EVERY_EPISODE = True   # ← toggle
+SAVE_EP_FIGS = False        # set a path like f"plots/ep_{ep}.png" if you want files
+
+for ep in range(EPISODES):
+    eps = epsilon_by_episode(ep)
+    s = env.reset()
+
+    tracker = EpisodeTracker()
+    mid_track = []
+    r_track = []
+    cum_track = []
+    cum_r = 0.0
+    done = False
+
+    while not done:
+        phase_before = env.phase  # capture BEFORE choosing action
+        if phase_before == 'continuous':
+            x = feat_clob(s, env).unsqueeze(0)
+            with torch.no_grad():
+                q_vals = clob_net(x)[0]
+            a_idx = random.randrange(len(CLOB_ACTIONS)) if random.random() < eps else int(torch.argmax(q_vals).item())
+            v, delta = CLOB_ACTIONS[a_idx]
+            v = min(v, s['X1'])
+
+            s2, r, done = env.step((v, delta))
+
+            if env.phase == 'continuous' and not done:
+                x2 = feat_clob(s2, env).unsqueeze(0)
+                with torch.no_grad():
+                    q_next = clob_net(x2).max(dim=1)[0]
+            else:
+                if not done:
+                    x2 = feat_auction(s2, env).unsqueeze(0)
+                    with torch.no_grad():
+                        q_next = auct_net(x2).max(dim=1)[0]
+                else:
+                    q_next = torch.tensor([0.0], device=DEVICE)
+
+            target = torch.tensor([r], device=DEVICE) + GAMMA * q_next
+            q_sa = clob_net(x)[0, a_idx].unsqueeze(0)
+            loss = mse(q_sa, target.detach())
+            opt_clob.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(clob_net.parameters(), 1.0)
+            opt_clob.step()
+
+            # --- logging for tracker (post-step state s2) ---
+            tracker.act_v.append(v)
+            tracker.act_delta.append(delta)
+            tracker.act_K.append(float('nan'))
+            tracker.act_S.append(float('nan'))
+
+        else:
+            x = feat_auction(s, env).unsqueeze(0)
+            with torch.no_grad():
+                q_vals = auct_net(x)[0]
+            a_idx = random.randrange(len(AUCT_ACTIONS)) if random.random() < eps else int(torch.argmax(q_vals).item())
+            K, off = AUCT_ACTIONS[a_idx]
+            S = s['X10'] + off
+            c_vec = [0] * (env.tau_cl + 1)
+
+            s2, r, done = env.step((K, S, c_vec))
+
+            if env.phase == 'auction' and not done:
+                x2 = feat_auction(s2, env).unsqueeze(0)
+                with torch.no_grad():
+                    q_next = auct_net(x2).max(dim=1)[0]
+            else:
+                q_next = torch.tensor([0.0], device=DEVICE)
+
+            target = torch.tensor([r], device=DEVICE) + GAMMA * q_next
+            q_sa = auct_net(x)[0, a_idx].unsqueeze(0)
+            loss = mse(q_sa, target.detach())
+            opt_auct.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(auct_net.parameters(), 1.0)
+            opt_auct.step()
+
+            # --- logging for tracker ---
+            tracker.act_v.append(float('nan'))
+            tracker.act_delta.append(float('nan'))
+            tracker.act_K.append(K)
+            tracker.act_S.append(S)
+
+        # common logging (use s2)
+        cum_r += r
+        r_track.append(r)
+        cum_track.append(cum_r)
+        mid_track.append(s2['X10'])
+
+        tracker.t.append(s2['time'])
+        tracker.phase.append('A' if env.phase == 'auction' else 'C')  # phase AFTER step
+        tracker.mid.append(s2['X10'])
+        tracker.H_cl.append(s2['X3'])
+        tracker.inv.append(s2['X1'])
+        tracker.depth_ask.append(s2['X4'])
+        tracker.depth_bid.append(s2['X5'])
+        tracker.top_ask.append(s2['X13'][0] if len(s2['X13']) else 0.0)
+        tracker.top_bid.append(s2['X14'][0] if len(s2['X14']) else 0.0)
+        tracker.N_plus.append(s2['X7'])
+        tracker.N_minus.append(s2['X8'])
+        tracker.last_exec.append(env.last_executed)
+        tracker.reward.append(r)
+        tracker.cum_reward.append(cum_r)
+
+        s = s2
+
+    all_mid_paths.append(mid_track)
+    all_step_rewards.append(r_track)
+    all_cum_rewards.append(cum_track)
+    final_inventories.append(env.inventory)
+
+    if PLOT_EVERY_EPISODE:
+        save_path = None
+        if SAVE_EP_FIGS:
+            import os; os.makedirs("plots", exist_ok=True)
+            save_path = f"plots/episode_{ep+1}.png"
+        plot_episode(tracker, ep+1, env.tau_op, env.tau_cl, save_path=save_path)
+
+
+# ---------------------
+# Plots
+# ---------------------
+plt.figure(figsize=(7,4))
+for ep, path in enumerate(all_mid_paths, 1):
+    plt.plot(path, label=f"Ep {ep}")
+plt.title("Mid-price trajectories (decision steps)")
+plt.xlabel("Decision step"); plt.ylabel("Mid price")
+plt.legend(ncol=2, fontsize=8); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(7,4))
+for ep, rpath in enumerate(all_step_rewards, 1):
+    plt.plot(rpath, label=f"Ep {ep}")
+plt.title("Step rewards per episode")
+plt.xlabel("Decision step"); plt.ylabel("Reward")
+plt.legend(ncol=2, fontsize=8); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(7,4))
+for ep, cpath in enumerate(all_cum_rewards, 1):
+    plt.plot(cpath, label=f"Ep {ep}")
+plt.title("Cumulative reward per episode")
+plt.xlabel("Decision step"); plt.ylabel("Cumulative reward")
+plt.legend(ncol=2, fontsize=8); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(6,4))
+plt.bar(range(1, EPISODES+1), final_inventories)
+plt.axhline(0, color='k', lw=0.7)
+plt.title("Final inventory by episode")
+plt.xlabel("Episode"); plt.ylabel("Inventory at τ^cl")
+plt.tight_layout(); plt.show()
+
+print("Final inventories:", final_inventories)
+print("Total cumulative rewards:", [round(c[-1], 2) for c in all_cum_rewards])
