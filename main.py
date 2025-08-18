@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 
 from dataclasses import dataclass, field
 
+plt.rcParams['text.usetex'] = True
+
 @dataclass
 class EpisodeTracker:
     t: list = field(default_factory=list)
@@ -38,38 +40,38 @@ def plot_episode(tr: EpisodeTracker, ep: int, tau_op: int, tau_cl: int, save_pat
     fig, axs = plt.subplots(3, 3, figsize=(12, 9))
 
     # 1) prices
-    axs[0,0].plot(tr.t, tr.mid, label='mid')
-    axs[0,0].plot(tr.t, tr.H_cl, label='H_cl', alpha=0.8)
+    axs[0,0].plot(tr.t, tr.mid, label='$S_t^\mathrm{mid}$')
+    axs[0,0].plot(tr.t, tr.H_cl, label='$H_t^\mathrm{cl}$', alpha=0.8)
     axs[0,0].axvline(tau_op, ls='--', lw=0.8, color='k')
-    axs[0,0].set_title('Mid vs H_cl'); axs[0,0].legend()
+    axs[0,0].set_title('$S_t^\mathrm{mid}$ vs $H_t^\mathrm{cl}$'); axs[0,0].legend()
 
     # 2) inventory & exec
-    axs[0,1].plot(tr.t, tr.inv, label='inventory')
+    axs[0,1].plot(tr.t, tr.inv, label='$I_t$')
     axs[0,1].axvline(tau_op, ls='--', lw=0.8, color='k'); axs[0,1].legend()
     axs[0,1].set_title('Inventory')
 
-    axs[0,2].plot(tr.t, tr.last_exec)
+    axs[0,2].plot(tr.t, tr.last_exec, label='$E_t$')
     axs[0,2].axvline(tau_op, ls='--', lw=0.8, color='k')
     axs[0,2].set_title('Executed (this step)')
 
     # 3) depths & top-of-book vols
-    axs[1,0].plot(tr.t, tr.depth_ask, label='ask depth')
-    axs[1,0].plot(tr.t, tr.depth_bid, label='bid depth')
+    axs[1,0].plot(tr.t, tr.depth_ask, label='$L_t^+$')
+    axs[1,0].plot(tr.t, tr.depth_bid, label='$L_t^-$')
     axs[1,0].axvline(tau_op, ls='--', lw=0.8, color='k'); axs[1,0].legend()
     axs[1,0].set_title('Depths')
 
-    axs[1,1].plot(tr.t, tr.top_ask, label='top ask vol')
-    axs[1,1].plot(tr.t, tr.top_bid, label='top bid vol')
+    axs[1,1].plot(tr.t, tr.top_ask, label='$V_t^{+,1}$')
+    axs[1,1].plot(tr.t, tr.top_bid, label='$V_t^{-,1}$')
     axs[1,1].axvline(tau_op, ls='--', lw=0.8, color='k'); axs[1,1].legend()
     axs[1,1].set_title('Top-of-book volumes')
 
-    axs[1,2].plot(tr.t, tr.N_plus, label='N+ (sell MOs)')
-    axs[1,2].plot(tr.t, tr.N_minus, label='N- (buy MOs)')
+    axs[1,2].plot(tr.t, tr.N_plus, label='$N_t^+$')
+    axs[1,2].plot(tr.t, tr.N_minus, label='$N_t^-$')
     axs[1,2].axvline(tau_op, ls='--', lw=0.8, color='k'); axs[1,2].legend()
     axs[1,2].set_title('Auction MO counters')
 
     # 4) rewards
-    axs[2,0].plot(tr.t, tr.reward); axs[2,0].set_title('Reward per step')
+    axs[2,0].plot(tr.t, tr.reward); axs[2,0].set_title('$R_t$')
     axs[2,0].axvline(tau_op, ls='--', lw=0.8, color='k')
 
     axs[2,1].plot(tr.t, tr.cum_reward); axs[2,1].set_title('Cumulative reward')
@@ -77,10 +79,10 @@ def plot_episode(tr: EpisodeTracker, ep: int, tau_op: int, tau_cl: int, save_pat
 
     # 5) actions
     # show CLOB actions (v, Δ) and Auction (K, S) on same axis with NaNs to break lines
-    axs[2,2].plot(tr.t, tr.act_v, label='CLOB v')
-    axs[2,2].plot(tr.t, tr.act_delta, label='CLOB Δ')
-    axs[2,2].plot(tr.t, tr.act_K, label='Auct K')
-    axs[2,2].plot(tr.t, tr.act_S, label='Auct S')
+    axs[2,2].plot(tr.t, tr.act_v, label='$v_t$ (CLOB)')
+    axs[2,2].plot(tr.t, tr.act_delta, label='$\delta_t$ (CLOB)')
+    axs[2,2].plot(tr.t, tr.act_K, label='$K_t^a$ (Auction)')
+    axs[2,2].plot(tr.t, tr.act_S, label='$S_t^a$ (Auction)')
     axs[2,2].axvline(tau_op, ls='--', lw=0.8, color='k')
     axs[2,2].legend(); axs[2,2].set_title('Actions')
 
@@ -97,7 +99,8 @@ def plot_episode(tr: EpisodeTracker, ep: int, tau_op: int, tau_cl: int, save_pat
 class MarketEmulator:
     def __init__(self, tau_op=10, tau_cl=15, I=10000, V=5000, L=10, Lc=5, La=5,
                  lambda_param=1.0, kappa=0.1, q=1.0, d=1.0, gamma=0.5, 
-                 v_m=1000, pareto_gamma=2.0, poisson_rate=0.5, sigma_mid=1.0, seed=None):
+                 v_m=1000, pareto_gamma=2.0, poisson_rate=0.5, sigma_mid=1.0, seed=None,
+                 V_top_max=5000.0):
         """
         Initialize the market emulator with given parameters.
         """
@@ -120,8 +123,22 @@ class MarketEmulator:
         self.pareto_shape = pareto_gamma
         self.poisson_rate = poisson_rate
         self.sigma_mid = sigma_mid
+        self.V_top_max = V_top_max
         # Initialize state
         self.reset()
+        
+    def _refresh_order_book(self):
+    # Fresh, independent Beta draws for ask/bid L1
+        V1a = 1000.0 * (4.0 * np.random.beta(0.5, 0.5) + 1.0)
+        V1b = 1000.0 * (4.0 * np.random.beta(0.5, 0.5) + 1.0)
+        V1a = float(min(V1a, self.V_top_max))
+        V1b = float(min(V1b, self.V_top_max))
+        # Geometric decay below the top level
+        self.ask_volumes = [V1a * (0.5 ** j) for j in range(self.Lc)]
+        self.bid_volumes = [V1b * (0.5 ** j) for j in range(self.Lc)]
+        # With positive volumes at all levels, depth is full book
+        self.depth_ask = self.Lc
+        self.depth_bid = self.Lc
     
     def reset(self):
         """Reset the environment to the beginning of an episode."""
@@ -135,15 +152,7 @@ class MarketEmulator:
         self.mid_price = 100.0  # arbitrary initial mid price
         self.H_cl = self.mid_price  # initialize hypothetical clearing price
         # Initialize order book volumes for continuous phase
-        # Sample best level volume from Beta(0.5, 0.5) scaled to [1000, 5000]
-        V1 = 1000.0 * (4.0 * np.random.beta(0.5, 0.5) + 1.0)
-        V1 = float(min(V1, self.V_max))
-        # Geometric volume decay for deeper levels
-        self.ask_volumes = [V1 * (0.5 ** j) for j in range(self.Lc)]
-        self.bid_volumes = [V1 * (0.5 ** j) for j in range(self.Lc)]
-        # Determine initial depth L_t^+ and L_t^- (first empty level, if any)
-        self.depth_ask = next((j+1 for j,v in enumerate(self.ask_volumes) if v <= 1e-6), self.Lc)
-        self.depth_bid = next((j+1 for j,v in enumerate(self.bid_volumes) if v <= 1e-6), self.Lc)
+        self._refresh_order_book() 
         # Market taker counters (cumulative number of arrivals) and volumes
         self.N_plus = 0   # number of sell MOs (arrived up to now)
         self.N_minus = 0  # number of buy MOs
@@ -364,6 +373,8 @@ class MarketEmulator:
                     current_time = next_sell_time
                     process_sell_order(volume=min(5000.0, self.V_max))
                     next_sell_time = current_time + np.random.exponential(scale=1.0 / self.poisson_rate)
+                    
+            self._refresh_order_book()
 
             # Decide at the boundary (always advance at least to target_time)
             next_decision_time = target_time
@@ -590,8 +601,8 @@ S_OFFSETS = [-1, 0, 1]
 AUCT_ACTIONS = [(K, off) for K, off in itertools.product(K_CHOICES, S_OFFSETS)]
 
 # Training tweaks
-EPISODES = 30
-LR = 5e-4          # a bit smaller
+EPISODES = 5
+LR = 5e-3          # a bit smaller
 GAMMA = 0.995      # slightly longer credit
 
 # ---------------------
@@ -811,7 +822,7 @@ plt.figure(figsize=(6,4))
 plt.bar(range(1, EPISODES+1), final_inventories)
 plt.axhline(0, color='k', lw=0.7)
 plt.title("Final inventory by episode")
-plt.xlabel("Episode"); plt.ylabel("Inventory at τ^cl")
+plt.xlabel("Episode"); plt.ylabel("Inventory at $\\tau^\mathrm{cl}$")
 plt.tight_layout(); plt.show()
 
 print("Final inventories:", final_inventories)
