@@ -680,12 +680,15 @@ class GLFTParams:
         ratio = 1.0 + self.gamma / self.k_alpha
         return self.A * (ratio ** (-(1.0 + self.k_alpha / self.gamma)))
 
+import numpy as np
+try:
+    from scipy.linalg import expm  # optional fast path
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
 
 class GLFTBenchmark:
-    """
-    Precomputes v_q(t) and produces the sell-only optimal ask quote delta_a^*(t,q)
-    in ticks. Maps the continuous delta to your discrete CLOB action set.
-    """
+    
     def __init__(self, params: GLFTParams, clob_actions, q_name_in_state="inv"):
         self.p = params
         self.clob_actions = clob_actions  # e.g. list[(v, delta_ticks)]
@@ -699,24 +702,72 @@ class GLFTBenchmark:
         self.allowed_clob = [(i, a) for i, a in enumerate(self.clob_actions) if a[0] > 0]
         self.delta_grid = np.array([a[1] for _, a in self.allowed_clob], dtype=float)
 
-    def _integrate_v(self):
+    def _build_M_sell_only(self):
         """
-        Solve: dot v_q(t) = alpha*q^2*v_q(t) - eta*v_{q-1}(t), v_q(T)=1.
-        Integrate backward in t on grid {0,...,T}. Time-major: v[t, q].
+        Build the (I+1)×(I+1) lower-bidiagonal generator M for the sell-only ODE:
+            \dot v_q = α q^2 v_q - η v_{q-1}, q>=1;    \dot v_0 = 0
+        so that v(t) = exp( -M (T - t) ) 1 enforces v(T)=1 exactly.
         """
-        I, T, dt = self.p.I_max, self.p.T, self.p.dt
-        # FIX: time-major shape (T+1, I+1), not (I+1, T+1)
-        v = np.ones((T + 1, I + 1), dtype=float)   # v[t, q], with v[T, q] = 1
+        I = self.p.I_max
+        M = np.zeros((I + 1, I + 1), dtype=float)
+        # diagonal: α q^2 for q>=1; 0 for q=0 (since \dot v_0 = 0)
+        q = np.arange(I + 1, dtype=float)
+        M[np.arange(I + 1), np.arange(I + 1)] = self.p.alpha_GLFT * (q ** 2)
+        M[0, 0] = 0.0
+        # subdiagonal: -η linking v_{q-1} into \dot v_q
+        for qidx in range(1, I + 1):
+            M[qidx, qidx - 1] = -self.p.eta_GLFT
+        return M
 
-        for t in range(T - 1, -1, -1):
-            for q in range(1, I + 1):
-                v[t, q] = v[t + 1, q] - dt * (
-                    self.p.alpha_GLFT * (q ** 2) * v[t + 1, q] - self.p.eta_GLFT * v[t + 1, q - 1]
-                )
-            v[t, 0] = v[t + 1, 0]  # \dot v_0 = 0
+    def _solve_v_timegrid(self, M):
+        """
+        Compute v[t, q] = [exp( -M (T - t) ) 1]_q for t=0..T, q=0..I.
+        Uses eigendecomposition if SciPy is unavailable; SciPy.expm if present.
+        """
+        I, T = self.p.I_max, self.p.T
+        one = np.ones(I + 1, dtype=float)
 
-        return v  # time-major: v[t, q]
+        if _HAVE_SCIPY:
+            v = np.empty((T + 1, I + 1), dtype=float)
+            for t in range(T + 1):
+                A = expm(-M * (T - t))
+                v[t] = A @ one
+            return v
 
+        # Fallback: eigendecomposition (works generically; M is lower-bidiagonal)
+        # M may be non-symmetric; allow complex and take real part at the end.
+        w, V = np.linalg.eig(M)             # M = V diag(w) V^{-1}
+        Vinv = np.linalg.inv(V)
+        b = Vinv @ one
+        v = np.empty((T + 1, I + 1), dtype=complex)
+        for t in range(T + 1):
+            e = np.exp(-(T - t) * w)        # elementwise
+            v[t] = V @ (e * b)
+        v = v.real
+
+        # Numerical hygiene: enforce terminal condition and strict positivity
+        v[-1, :] = 1.0
+        v = np.clip(v, 1e-15, np.inf)
+        return v
+
+    def precompute(self):
+        """
+        Exact precompute of v and delta* from matrix exponential (no time stepping).
+        """
+        # 1) Build sell-only M and solve v(t) exactly on the integer grid
+        M = self._build_M_sell_only()
+        v = self._solve_v_timegrid(M)
+
+        # 2) Sanity: shapes & terminal condition
+        assert v.shape == (self.p.T + 1, self.p.I_max + 1)
+        # v[T,·] should be 1 exactly (up to numerical tolerance)
+        if not np.allclose(v[-1], 1.0, rtol=1e-10, atol=1e-12):
+            raise RuntimeError("v(T,·) ≠ 1 after matrix exponential; check M construction.")
+
+        # 3) Store and compute optimal ask deltas (in ticks)
+        self.v = v
+        self.delta_star = self._compute_deltas(v)
+        assert self.delta_star.shape == (self.p.T + 1, self.p.I_max + 1)
 
     def _compute_deltas(self, v):
         """
@@ -735,14 +786,6 @@ class GLFTBenchmark:
                 delt[t, q] = inv_kalpha * np.log(ratio) + const
             delt[t, 0] = np.inf
         return delt  # shape (T+1, I+1)
-
-    def precompute(self):
-        v = self._integrate_v()
-        assert v.shape == (self.p.T + 1, self.p.I_max + 1)
-        self.v = v
-        self.delta_star = self._compute_deltas(v)
-        assert self.delta_star.shape == (self.p.T + 1, self.p.I_max + 1)
-
 
     def _state_get_inventory(self, s, env=None):
         """
@@ -991,7 +1034,7 @@ S_OFFSETS = [-1, 0, 1]
 AUCT_ACTIONS = [(K, off) for K, off in itertools.product(K_CHOICES, S_OFFSETS)]
 
 # Training tweaks
-EPISODES = 5
+EPISODES = 200
 LR = 5e-2          # a bit smaller
 GAMMA = 0.995      # slightly longer credit
 
@@ -1273,12 +1316,11 @@ for ep in range(EPISODES):
     eval_r = run_eval_episode(env, clob_net, auct_net)
     eval_returns.append(eval_r)
 
-    do_plot = PLOT_EVERY_EPISODE# and (not PLOT_EVERY_N or (ep+1) % PLOT_EVERY_N == 0)
-
+    do_plot = PLOT_EVERY_EPISODE and (not PLOT_EVERY_N or (ep+1) % PLOT_EVERY_N == 0)
+    # --- end-of-episode loss means ---
+    clob_loss_per_ep.append(clob_loss_sum / max(1, clob_updates))
+    auct_loss_per_ep.append(auct_loss_sum / max(1, auct_updates))
     if do_plot:
-        # --- end-of-episode loss means ---
-        clob_loss_per_ep.append(clob_loss_sum / max(1, clob_updates))
-        auct_loss_per_ep.append(auct_loss_sum / max(1, auct_updates))
         save_path = None
         if SAVE_EP_FIGS:
             import os; os.makedirs("plots", exist_ok=True)
