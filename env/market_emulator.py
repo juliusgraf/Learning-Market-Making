@@ -72,6 +72,11 @@ class MarketEmulator:
 
     State encoders/action spaces live in env/state_encoder.py and env/action_space.py.
     """
+    def _bm_step(self) -> float:
+        """One Brownian tick for the mid price."""
+        dW = float(self.rng.normal(0.0, 1.0))
+        self.mid = float(self.mid + self.cfg.sigma_mid * dW)  # dt = 1
+        return self.mid
 
     def __init__(self, cfg: EnvConfig, rng: Optional[np.random.Generator] = None):
         self.cfg = cfg
@@ -176,9 +181,11 @@ class MarketEmulator:
             match_res = self.orderbook.simulate_taker_arrivals(buy_qty=buy_qty, sell_qty=sell_qty)
             agent_exec = int(match_res["agent_exec"])
             self.inventory = max(0, self.inventory - agent_exec)
+            self.orderbook.refresh_standing_orders_from_ladders(self.mid)
 
-            # Compute H_cl via Algorithm 1 (using standing orders snapshot)
-            self.H_cl = self.orderbook.compute_hypo_clearing(self.cfg.gamma_smooth, prev_Hcl=self.H_cl)
+            # Algorithm 1 on the *current* snapshot
+            prev = self.H_cl if self.H_cl is not None else self.mid
+            self.H_cl = self.orderbook.compute_hypo_clearing(self.cfg.gamma_smooth, prev_Hcl=prev)  
 
             # Execution price S•_t = α(δ_mid + delta_idx), we snap mid to the α-grid
             grid_mid = round(self.mid / self.cfg.alpha) * self.cfg.alpha
@@ -250,6 +257,8 @@ class MarketEmulator:
         # One-step auction reward (non-terminal)
         reward = self._reward_auction_step(K_a=Ka, S_a=Sa, c_count=cancels_applied, H_cl=self.H_cl)
 
+        self._update_mid_brownian()
+        
         # Time advance
         self.auction._t += 1
         self.t += 1
@@ -315,7 +324,7 @@ class MarketEmulator:
         """
         r = S• * E * f(1 - κ f(H_cl - S•)), f(x)=(x)+. :contentReference[oaicite:9]{index=9}
         """
-        gap = self._f_plus(H_cl - S_star)
+        gap = H_cl - S_star # self._f_plus(H_cl - S_star)
         inner = 1.0 - self.cfg.kappa * gap
         factor = self._f_plus(inner)
         return float(S_star * exec_qty * factor)

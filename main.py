@@ -99,7 +99,7 @@ def plot_episode(tr: EpisodeTracker, ep: int, tau_op: int, tau_cl: int, save_pat
 
 class MarketEmulator:
     def __init__(self, tau_op=10, tau_cl=15, I=10000, V=5000, L=10, Lc=5, La=5,
-                 lambda_param=1.0, kappa=0.1, q=1.0, d=1.0, gamma=0.5, 
+                 lambda_param=0.005, kappa=0.1, q=1.0, d=1.0, gamma=0.5, 
                  v_m=1000, pareto_gamma=2.0, poisson_rate=0.5, sigma_mid=1.0, seed=None,
                  V_top_max=5000.0, lambda_decision=1.0, alpha=1.0):
         """
@@ -504,7 +504,7 @@ class MarketEmulator:
                 self.N_plus = 0; self.N_minus = 0
                 self.market_sell_volumes = [0.0] * self.L_max
                 self.market_buy_volumes = [0.0] * self.L_max
-                self.active_supply = []
+                self.active_supply = [] 
 
             next_state = self._get_state()
             return next_state, reward, done
@@ -522,8 +522,8 @@ class MarketEmulator:
             # 1. Process exogenous arrivals/cancellations at time t
             # (a) Exogenous limit (supply) orders
             if np.random.rand() < 0.3 and len(self.active_supply) < self.La:
-                K_new = np.random.uniform(0.0, 50.0)
-                S_new = self.mid_price + np.random.uniform(-5.0, 5.0) * 2.0  # width 10 around mid
+                K_new = np.random.uniform(0.1, 2.0)
+                S_new = self.mid_price + np.random.uniform(-5.0, 5.0) * 1.0  # width 10 around mid
                 self.active_supply.append((float(K_new), float(S_new)))
             if np.random.rand() < 0.2 and self.active_supply:
                 idx = int(np.random.randint(0, len(self.active_supply)))
@@ -703,21 +703,16 @@ class GLFTBenchmark:
         self.delta_grid = np.array([a[1] for _, a in self.allowed_clob], dtype=float)
 
     def _build_M_sell_only(self):
-        """
-        Build the (I+1)×(I+1) lower-bidiagonal generator M for the sell-only ODE:
-            \dot v_q = α q^2 v_q - η v_{q-1}, q>=1;    \dot v_0 = 0
-        so that v(t) = exp( -M (T - t) ) 1 enforces v(T)=1 exactly.
-        """
         I = self.p.I_max
-        M = np.zeros((I + 1, I + 1), dtype=float)
-        # diagonal: α q^2 for q>=1; 0 for q=0 (since \dot v_0 = 0)
-        q = np.arange(I + 1, dtype=float)
-        M[np.arange(I + 1), np.arange(I + 1)] = self.p.alpha_GLFT * (q ** 2)
+        M = np.zeros((I+1, I+1), dtype=float)
+        q = np.arange(I+1, dtype=float)
+        M[np.arange(1, I+1), np.arange(1, I+1)] = self.p.alpha_GLFT * (q[1:]**2) + self.p.eta_GLFT
         M[0, 0] = 0.0
-        # subdiagonal: -η linking v_{q-1} into \dot v_q
-        for qidx in range(1, I + 1):
-            M[qidx, qidx - 1] = -self.p.eta_GLFT
+        # subdiagonal: -eta
+        for qq in range(1, I+1):
+            M[qq, qq-1] = -self.p.eta_GLFT
         return M
+
 
     def _solve_v_timegrid(self, M):
         """
@@ -730,7 +725,7 @@ class GLFTBenchmark:
         if _HAVE_SCIPY:
             v = np.empty((T + 1, I + 1), dtype=float)
             for t in range(T + 1):
-                A = expm(-M * (T - t))
+                A = expm(-M * (T - t) * self.p.dt)
                 v[t] = A @ one
             return v
 
@@ -853,12 +848,7 @@ class GLFTBenchmark:
         if q <= 0:
             # No inventory: choose any valid no-trade CLOB action if you have one, else the smallest-volume action.
             # Prefer an explicit 'v=0' action if present:
-            for i, a in enumerate(self.clob_actions):
-                if a[0] == 0:
-                    return i
-            # else pick the min-volume ask action (v>0) with largest delta to be conservative
-            idx, _ = max(self.allowed_clob, key=lambda p: p[1][1])
-            return idx
+            return next(i for i, a in enumerate(self.clob_actions) if a[0] == 0)
 
         t_idx = int(np.clip(t_idx, 0, self.p.T))
         delta_star = self.delta_star[t_idx, min(q, self.p.I_max)]
@@ -1005,19 +995,19 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
 # Create env (stable-ish defaults)
 env = MarketEmulator(
-    tau_op=15,           # a bit more continuous time
-    tau_cl=18,
-    I=1000,              # smaller inventory bound
-    V=500,               # smaller per-order cap
+    tau_op=100,           # a bit more continuous time
+    tau_cl=120,
+    I=100,              # smaller inventory bound
+    V=5,               # smaller per-order cap
     L=10,
     Lc=10,
-    La=10,
-    lambda_param=5e-3,   # ↓↓↓ shrink terminal inventory penalty
-    kappa=0.1,
-    q=0.1,              # wrong-side penalty softer
-    d=0.1,              # cancellation cost softer
+    La=100,
+    lambda_param= 0.005,   # ↓↓↓ shrink terminal inventory penalty
+    kappa=1.0,
+    q=1.0,              # wrong-side penalty softer
+    d=0.01,              # cancellation cost softer
     gamma=0.5,
-    v_m=300,             # pareto scale smaller
+    v_m=1.0,             # pareto scale smaller
     pareto_gamma=2.5,    # lighter tails
     poisson_rate=2.0,    # more arrivals → more fills
     sigma_mid=0.2,       # calmer mid-price
@@ -1025,16 +1015,20 @@ env = MarketEmulator(
 )
 
 # Actions: smaller steps
-V_CHOICES = [0, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500]
-DELTA_CHOICES = [0, 1, 2]
-CLOB_ACTIONS = [(v, d) for v, d in itertools.product(V_CHOICES, DELTA_CHOICES)]
+V_CHOICES = [0, 1, 2, 3, 4, 5]
+DELTA_CHOICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # in ticks
+CLOB_ACTIONS = [(0, d) for d in DELTA_CHOICES] + [(v, d) for v in V_CHOICES[1:] for d in DELTA_CHOICES]
 
-K_CHOICES = [0.0, 1.0, 2.5, 5.0, 7.5, 10.0]
-S_OFFSETS = [-1, 0, 1]
+# Let K scale with inventory and remaining auction steps
+STEPS_AUCT = max(1, env.tau_cl - env.tau_op)
+K_MAX = 2.0 * env.I_max / STEPS_AUCT   # enough slope to clear over the horizon
+K_CHOICES = [0.0] + list(np.linspace(0.5, K_MAX, 8))
+# Encourage being on the sell side at the close
+S_OFFSETS = [-4, -3, -2, -1, 0]
 AUCT_ACTIONS = [(K, off) for K, off in itertools.product(K_CHOICES, S_OFFSETS)]
 
 # Training tweaks
-EPISODES = 200
+EPISODES = 500
 LR = 5e-2          # a bit smaller
 GAMMA = 0.995      # slightly longer credit
 
@@ -1042,11 +1036,11 @@ GAMMA = 0.995      # slightly longer credit
 # GLFT params (tune/calibrate as you like)
 # ---------------------
 GLFT_A       = 1.0        # base hit intensity (arbitrary scale)
-GLFT_k       = 1.0        # per-currency decay; *effective* slope is k*alpha in ticks
+GLFT_k       = 0.1        # per-currency decay; *effective* slope is k*alpha in ticks
 GLFT_gamma   = 1e-4       # CARA risk aversion
 GLFT_sigma   = 1.0        # per-step mid-price vol used in benchmark (match your env)
 GLFT_T       = int(getattr(env, "tau_op", 100))     # CLOB horizon; falls back to 100
-GLFT_I_MAX   = int(getattr(env, "I", 50))           # inventory cap I
+GLFT_I_MAX   = int(getattr(env, "I", 100))           # inventory cap I
 GLFT_ALPHA   = float(getattr(env, "alpha", 1.0))    # tick size
 
 glft_params = GLFTParams(
@@ -1099,9 +1093,9 @@ class DQN(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 64), nn.ReLU(),
-            nn.Linear(64, 64), nn.ReLU(),
-            nn.Linear(64, out_dim)
+            nn.Linear(in_dim, 128), nn.ReLU(),
+            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(128, out_dim)
         )
     def forward(self, x):
         return self.net(x)
@@ -1175,7 +1169,7 @@ auct_loss_per_ep = []
 # ---------------------
 PLOT_EVERY_EPISODE = True   # ← toggle
 SAVE_EP_FIGS = False        # set a path like f"plots/ep_{ep}.png" if you want files
-PLOT_EVERY_N = 50   # 0/None disables the cadence filter
+PLOT_EVERY_N = 100          # 0/None disables the cadence filter
 
 # Collectors for regret analysis
 EPISODE_SEEDS = []
@@ -1266,7 +1260,7 @@ for ep in range(EPISODES):
                 q_next = torch.tensor([0.0], device=DEVICE)
 
 
-            target = torch.tensor([r], device=DEVICE) + GAMMA * q_next
+            target = torch.tensor([r * REWARD_SCALE], device=DEVICE) + GAMMA * q_next
             q_sa = auct_net(x)[0, a_idx].unsqueeze(0)
             loss = mse(q_sa, target.detach())
             opt_auct.zero_grad(); loss.backward()

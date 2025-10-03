@@ -25,11 +25,11 @@ def build_default_env() -> tuple[MarketEmulator, StateEncoder, ActionSpace, GLFT
     env_cfg = EnvConfig(
         tau_open=100, tau_close=120, alpha=0.01, beta=0.05, B=10, V_max=5,
         L_c=10, L_a=10, L_takers=100, I_max=100,
-        lambda_arrival=2.0, v_market=1, sigma_mid=0.2,
-        pareto_vm=1.0, pareto_gamma=1.5, K_l=0.1, K_u=2.0, eps_contract=0.1,
+        lambda_arrival=10.0, v_market=5.0, sigma_mid=0.2,
+        pareto_vm=5.0, pareto_gamma=1.5, K_l=0.1, K_u=2.0, eps_contract=0.1,
         M_side_grid=5, p_new_mm=0.3, p_cancel_mm=0.1,
         p_new_taker=0.5, p_cancel_taker=0.1, gamma_smooth=0.5,
-        kappa=1.0, q_wrong_side=1.0, d_cancel=0.01, lambda_term=0.1, initial_mid=100.0,
+        kappa=1.0, q_wrong_side=1.0, d_cancel=0.01, lambda_term=0.005, initial_mid=100.0,
     )
 
     encoder = StateEncoder(env_cfg.tau_close, env_cfg.alpha, env_cfg.B, env_cfg.L_c, env_cfg.L_a)
@@ -40,7 +40,7 @@ def build_default_env() -> tuple[MarketEmulator, StateEncoder, ActionSpace, GLFT
     env = MarketEmulator(env_cfg, rng=np.random.default_rng(42))
     glft = GLFTBenchmark(
         A=1.0,
-        k=0.1,
+        k=1.0,
         sigma=env_cfg.sigma_mid,
         Q=env_cfg.I_max,
         T=env_cfg.tau_open - 1,

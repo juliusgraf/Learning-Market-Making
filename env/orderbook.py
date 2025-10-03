@@ -91,6 +91,32 @@ class OrderBook:
         )
         return self.state
 
+    def refresh_standing_orders_from_ladders(self, mid: float) -> None:
+        """
+        Rebuild state.standing_orders from current ladders V_plus/V_minus
+        using the snapped grid mid.
+        """
+        if self.state is None:
+            raise RuntimeError("OrderBook.reset must be called before refreshing orders.")
+
+        grid_mid = round(mid / self.alpha) * self.alpha
+        orders = []
+
+        # asks: +1 .. +L_c
+        for j, vol in enumerate(self.state.levels_plus, start=1):
+            v = float(vol)
+            if v > 0.0:
+                price = grid_mid + j * self.alpha
+                orders.append((price, v))
+
+        # bids: -1 .. -L_c
+        for j, vol in enumerate(self.state.levels_minus, start=1):
+            v = float(vol)
+            if v > 0.0:
+                price = grid_mid - j * self.alpha
+                orders.append((price, v))
+
+        self.state.standing_orders = orders
     # ---------------------------------------------------------------------
     # Agent interaction (place limit sell)
     # ---------------------------------------------------------------------
