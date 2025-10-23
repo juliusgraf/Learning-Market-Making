@@ -54,3 +54,4 @@ class RegretAnalyzer:
         """Clear all stored regrets."""
         self._regrets.clear()
         self._cumulative = 0.0
+

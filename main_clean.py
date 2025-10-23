@@ -7,11 +7,16 @@ import torch.nn as nn
 from collections import defaultdict
 import torch.optim as optim
 import matplotlib.pyplot as plt
+from typing import Optional
 
 from dataclasses import dataclass, field
 
-plt.rcParams['text.usetex'] = True
+try:
+    plt.rcParams['text.usetex'] = True
+except Exception:
+    plt.rcParams['text.usetex'] = False
 
+@dataclass
 @dataclass
 class EpisodeTracker:
     t: list = field(default_factory=list)
@@ -39,7 +44,8 @@ def plot_episode(tr: EpisodeTracker, ep: int, tau_op: int, tau_cl: int, save_pat
 
     T = np.arange(len(tr.t))
     fig, axs = plt.subplots(3, 3, figsize=(12, 9))
-
+    T = lambda arr: tr.t[:len(arr)]
+    
     # 1) prices
     axs[0,0].plot(tr.t, tr.mid, label='$S_t^\mathrm{mid}$')
     axs[0,0].plot(tr.t, tr.H_cl, label='$H_t^\mathrm{cl}$', alpha=0.8)
@@ -80,10 +86,10 @@ def plot_episode(tr: EpisodeTracker, ep: int, tau_op: int, tau_cl: int, save_pat
 
     # 5) actions
     # show CLOB actions (v, Δ) and Auction (K, S) on same axis with NaNs to break lines
-    axs[2,2].plot(tr.t, tr.act_v, label='$v_t$ (CLOB)')
-    axs[2,2].plot(tr.t, tr.act_delta, label='$\delta_t$ (CLOB)')
-    axs[2,2].plot(tr.t, tr.act_K, label='$K_t^a$ (Auction)')
-    axs[2,2].plot(tr.t, tr.act_S, label='$S_t^a$ (Auction)')
+    axs[2,2].plot(T(tr.act_v), tr.act_v, label='$v_t$ (CLOB)')
+    axs[2,2].plot(T(tr.act_delta), tr.act_delta, label='$\delta_t$ (CLOB)')
+    axs[2,2].plot(T(tr.act_K), tr.act_K, label='$K_t^a$ (Auction)')
+    axs[2,2].plot(T(tr.act_S), tr.act_S, label='$S_t^a$ (Auction)')
     axs[2,2].axvline(tau_op, ls='--', lw=0.8, color='k')
     axs[2,2].legend(); axs[2,2].set_title('Actions')
 
@@ -106,8 +112,11 @@ class MarketEmulator:
         """
         Initialize the market emulator with given parameters.
         """
+        self._seed: Optional[int] = None
+        self.rng: np.random.Generator = np.random.default_rng()  # default
         if seed is not None:
-            torch.manual_seed(seed)
+            self.set_seed(seed)
+        
         # Save parameters
         self.tau_op = tau_op
         self.tau_cl = tau_cl
@@ -140,6 +149,18 @@ class MarketEmulator:
         # Initialize state
         self.reset()
         
+    def set_seed(self, seed: int) -> None:
+        """Set env seed for both new Generator and legacy global RNG."""
+        s = int(seed)
+        self._seed = s
+        # Generator-based RNG for any code that uses self.rng
+        self.rng = np.random.default_rng(s)
+        # Also seed legacy APIs in case the code uses np.random.*
+        np.random.seed(s % (2**32 - 1))
+        # If any Python 'random' calls are used, seed them too
+        random.seed(s)
+
+        
     def _refresh_order_book(self):
     # Fresh, independent Beta draws for ask/bid L1
         V1a = float(self.V_top_max * np.random.beta(self.beta_a, self.beta_b))
@@ -157,7 +178,9 @@ class MarketEmulator:
         return float(min(vol, self.V_max))
 
     
-    def reset(self):
+    def reset(self, seed: Optional[int] = None):
+        if seed is not None:
+            self.set_seed(seed)
         """Reset the environment to the beginning of an episode."""
         # Phase and time
         self.phase = 'continuous'
@@ -1028,15 +1051,8 @@ def run_glft_benchmark_episodes(env, glft: GLFTBenchmark, episode_seeds, auction
         if auction_actions is not None:
             AUCTION_NOOP_IDX = GLFTBenchmark.find_auction_noop_index(auction_actions)
 
-        for ep, seeds in enumerate(episode_seeds):
-            # restore PRNG states
-            random.setstate(seeds.get("py"))
-            np.random.set_state(seeds.get("np"))
-            if _HAVE_TORCH and "torch" in seeds:
-                import torch as _torch
-                _torch.random.set_rng_state(seeds["torch"])
-
-            s = env.reset()
+        for seed in episode_seeds:
+            s = env.reset(seed=seed)
             done = False
             cum_r = 0.0
             t_idx = 0
@@ -1129,7 +1145,7 @@ env = MarketEmulator(
     L=12, Lc=12, La=12,         # book depth & auction supply capacity
 
     # costs / penalties (tune to taste)
-    lambda_param=0.1,         # leftover inventory penalty weight for I^2
+    lambda_param=0.02,         # leftover inventory penalty weight for I^2
     kappa=0.01,                  # concavity in revenue term (your f(·))
     q=1.0,                      # wrong-side penalty weight
     d=0.05,                     # cancel cost
@@ -1165,16 +1181,16 @@ AUCT_ACTIONS = [(K, off, cancel)
                 for off in S_OFFSETS
                 for cancel in (0, 1)]
 # Training tweaks
-EPISODES = 1000
-LR = 5e-2          # a bit smaller
+EPISODES = 800
+LR = 5e-3          # a bit smaller
 GAMMA = 0.995      # slightly longer credit
 
 # ---------------------
 # GLFT params (tune/calibrate as you like)
 # ---------------------
 
-GLFT_A       = 1.0        # base hit intensity (arbitrary scale)
-GLFT_k       = 0.8        # per-currency decay; *effective* slope is k*alpha in ticks
+GLFT_A       = 0.9        # base hit intensity (arbitrary scale)
+GLFT_k       = 1.0        # per-currency decay; *effective* slope is k*alpha in ticks
 GLFT_gamma   = 0.0        # CARA risk aversion
 GLFT_sigma   = float(getattr(env, "sigma_mid", 0.2))        # per-step mid-price vol used in benchmark (match your env)
 GLFT_T       = int(getattr(env, "tau_op", 100)) - 1    # CLOB horizon; falls back to 100
@@ -1272,28 +1288,8 @@ all_step_rewards = []
 all_cum_rewards = []
 final_inventories = []
 
-def _snap_rng():
-    import torch
-    return {"py": random.getstate(), "np": np.random.get_state(), "torch": torch.random.get_rng_state()}
-
-def _restore_rng(seed):
-    import torch
-    random.setstate(seed["py"]); np.random.set_state(seed["np"]); torch.random.set_rng_state(seed["torch"])
-    
-EVAL_SEEDS = []
-_snap = _snap_rng()
-rng = np.random.RandomState(12345)
-for _ in range(16): 
-    random.seed(int(rng.randint(2**31-1)))
-    np.random.seed(int(rng.randint(2**31-1)))
-    import torch; torch.manual_seed(int(rng.randint(2**31-1)))
-    EVAL_SEEDS.append(_snap_rng())
-_restore_rng(_snap)
-
 def run_eval_episode(env, clob_net, auct_net, seed=None):
-    if seed is not None:
-        _restore_rng(seed)
-    s = env.reset()
+    s = env.reset(seed=seed)
     done = False
     total_r = 0.0
     while not done:
@@ -1333,21 +1329,31 @@ auct_loss_per_ep = []
 # ---------------------
 PLOT_EVERY_EPISODE = True   # ← toggle
 SAVE_EP_FIGS = False        # set a path like f"plots/ep_{ep}.png" if you want files
-PLOT_EVERY_N = 2100          # 0/None disables the cadence filter
+PLOT_EVERY_N = EPISODES          # 0/None disables the cadence filter
 
 # Collectors for regret analysis
-EPISODE_SEEDS = []
 DQN_RETURNS = []
 
 # --- evaluation config ---
 EVAL_INTERVAL = 10
 N_EVAL_EPISODES = 32
-EVAL_SEEDS = EPISODE_SEEDS[:N_EVAL_EPISODES]  # fixed seeds for deterministic eval
+# Using precomputed EVAL_SEEDS from RNG snapshots above
+# EVAL_SEEDS = EPISODE_SEEDS[:N_EVAL_EPISODES]
 eval_returns = []  # collect eval curve you’ll plot
 
+MASTER_SEED = 123456
+EVAL_MASTER_SEED = 424242
+
+_rng_train = np.random.default_rng(MASTER_SEED)
+EPISODE_SEEDS = _rng_train.integers(0, 2**32 - 1, size=EPISODES, dtype=np.uint32).tolist()
+
+_rng_eval = np.random.default_rng(EVAL_MASTER_SEED)
+EVAL_SEEDS = _rng_eval.integers(0, 2**32 - 1, size=N_EVAL_EPISODES, dtype=np.uint32).tolist()
+
 for ep in range(EPISODES):
+    seed = int(EPISODE_SEEDS[ep])
     eps = epsilon_by_episode(ep)
-    s = env.reset()
+    s = env.reset(seed=seed)
     
     # --- INITIAL LOGGING so the very first point shows I_0 (e.g., 100) ---
     tracker = EpisodeTracker()
@@ -1377,21 +1383,7 @@ for ep in range(EPISODES):
     tracker.cum_reward.append(0.0)
     # --- end initial logging ---
 
-    
-    # Save seeds so we can replay the same randomness with the benchmark policy
-    EPISODE_SEEDS.append({
-        "py": random.getstate(),
-        "np": np.random.get_state(),
-        "torch": torch.random.get_rng_state()
-    })
-
-    
-    tracker = EpisodeTracker()
-    mid_track = []
-    r_track = []
-    cum_track = []
-    cum_r = 0.0
-    done = False
+    # (removed duplicate tracker reinitialization)
     
     # --- loss accumulators for this episode ---
     clob_loss_sum, clob_updates = 0.0, 0
@@ -1511,7 +1503,8 @@ for ep in range(EPISODES):
     
     # --- evaluation on fixed seeds (greedy; no learning) ---
     if (ep + 1) % EVAL_INTERVAL == 0:
-        eval_r = float(np.mean([run_eval_episode(env, clob_net, auct_net, seed=s) for s in EVAL_SEEDS]))
+        eval_r = float(np.mean([run_eval_episode(env, clob_net, auct_net, seed=int(s)) 
+                        for s in EVAL_SEEDS]))
         eval_returns.append(eval_r)
     else:
         eval_returns.append(eval_returns[-1] if len(eval_returns) else np.nan)
@@ -1520,9 +1513,6 @@ for ep in range(EPISODES):
     all_step_rewards.append(r_track)
     all_cum_rewards.append(cum_track)
     final_inventories.append(env.inventory)
-    
-    eval_r = run_eval_episode(env, clob_net, auct_net)
-    eval_returns.append(eval_r)
 
     do_plot = PLOT_EVERY_EPISODE and (not PLOT_EVERY_N or (ep+1) % PLOT_EVERY_N == 0)
     # --- end-of-episode loss means ---

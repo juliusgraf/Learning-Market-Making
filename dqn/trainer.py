@@ -250,32 +250,121 @@ class Trainer:
     # ------------------------------------------------------------------
     def _evaluate(self, episodes: int = 10) -> Dict[str, float]:
         """
-        Run greedy episodes (ε=0) and compute mean return.
-        If a GLFT benchmark is provided, also compute a regret proxy:
-            regret_e = V*_0(e) - R_e
+        Run greedy episodes (ε=0) and compute mean return for the RL policy.
+        Additionally, if a GLFT benchmark is provided, replay the SAME episodes
+        with the GLFT policy (CLOB-only; no auction trading; leftover liquidated
+        at S_T^mid where T=τ_op-1) to obtain comparable realized returns.
+        We also keep the original value-regret proxy against V*_0 for continuity.
         """
-        returns: List[float] = []
-        regrets: List[float] = []
+        import random
+
+        def _snapshot_seeds():
+            seeds = {"py": random.getstate(), "np": np.random.get_state()}
+            try:
+                import torch as _torch
+                seeds["torch"] = _torch.random.get_rng_state()
+            except Exception:
+                pass
+            return seeds
+
+        def _restore_seeds(seeds):
+            random.setstate(seeds["py"])
+            np.random.set_state(seeds["np"])
+            try:
+                import torch as _torch
+                if "torch" in seeds:
+                    _torch.random.set_rng_state(seeds["torch"])
+            except Exception:
+                pass
+
+        def _extract_delta_and_volume(act):
+            # Pull (delta_ticks, volume) from a decoded action (dict/object/tuple).
+            delta = None
+            vol = None
+            if isinstance(act, dict):
+                for k in ("delta_ticks", "delta", "ask_delta", "d"):
+                    if k in act:
+                        delta = float(act[k]); break
+                for k in ("volume", "v", "qty", "size"):
+                    if k in act:
+                        vol = int(act[k]); break
+            else:
+                # tuple-like
+                if hasattr(act, "__iter__") and not hasattr(act, "keys"):
+                    lst = list(act)
+                    if len(lst) >= 2:
+                        try: vol = int(lst[0])
+                        except Exception: pass
+                        try: delta = float(lst[1])
+                        except Exception: pass
+                # attributes
+                if delta is None:
+                    for k in ("delta_ticks", "delta", "ask_delta", "d"):
+                        if hasattr(act, k):
+                            try:
+                                delta = float(getattr(act, k)); break
+                            except Exception:
+                                pass
+                if vol is None:
+                    for k in ("volume", "v", "qty", "size"):
+                        if hasattr(act, k):
+                            try:
+                                vol = int(getattr(act, k)); break
+                            except Exception:
+                                pass
+            return delta, vol
+
+        def _choose_idx_for_delta(delta_ticks_target: float, q: int, adm_indices: List[int]) -> int:
+            # Among admissible indices, pick the one with vol<=q and delta closest to target.
+            # If none satisfy vol<=q, ignore vol. Prefer larger volume on ties.
+            best = None; best_key = (float("inf"), 0)      # (|Δ|, -vol)
+            fallback = None; fallback_key = (float("inf"), 0)
+            for idx in adm_indices:
+                act = self.actions.decode(idx)
+                d, v = _extract_delta_and_volume(act)
+                if d is None:  # skip if no delta info
+                    continue
+                v_eff = int(v) if v is not None else 0
+                key = (abs(float(d) - float(delta_ticks_target)), -v_eff)
+                if v_eff <= max(0, int(q)):
+                    if key < best_key: best_key, best = key, idx
+                else:
+                    if key < fallback_key: fallback_key, fallback = key, idx
+            return best if best is not None else (fallback if fallback is not None else adm_indices[0])
+
+        # -------- Pass 1: RL greedy episodes (store returns + per-episode seeds) --------
+        rl_returns: List[float] = []
+        regrets_value: List[float] = []
+        episode_seeds: List[dict] = []
 
         greedy_eps = EpsilonScheduler(start=0.0, end=0.0, decay_steps=1)
 
         for _ in range(max(1, int(episodes))):
+            episode_seeds.append(_snapshot_seeds())
+
             s_dict = self.env.reset()
             obs = self.encoder.encode(s_dict)
             done = False
             total_reward = 0.0
-            # Benchmark start value
+            steps = 0
+
+            # Legacy value-regret baseline V*_0 (optional)
             v_star_0 = None
             if self.glft is not None:
                 try:
                     q0 = int(self.env.cfg.I_max)
-                    s0 = float(s_dict.get("mid", self.env.cfg.initial_mid))
-                    v_star_0 = float(self.glft.expected_value(x0=0.0, q0=q0, s0=s0))
+                    s0 = float(s_dict.get("mid", getattr(self.env.cfg, "initial_mid", 0.0)))
+                    x0 = 0.0
+                    v_star_0 = float(self.glft.expected_value(x0=x0, q0=q0, s0=s0))
                 except Exception:
                     v_star_0 = None
 
-            steps = 0
-            max_steps = int(self.env.cfg.tau_close)
+            max_steps = (
+                int(self.train_cfg.max_steps_per_episode)
+                if self.train_cfg.max_steps_per_episode is not None
+                else int(self.env.cfg.tau_close)
+            )
+
             while not done and steps < max_steps:
                 adm = self.actions.admissible(
                     t=s_dict["t"],
@@ -290,27 +379,124 @@ class Trainer:
                 a_idx = self.agent.act(obs=obs, step=0, eps_sched=greedy_eps, admissible=adm)
                 act_struct = self.actions.decode(a_idx)
                 step_res = self.env.step(act_struct)
+
                 total_reward += float(step_res.reward)
                 s_dict = step_res.next_state
                 obs = self.encoder.encode(s_dict)
                 done = bool(step_res.done)
                 steps += 1
 
-            returns.append(total_reward)
+            rl_returns.append(total_reward)
             if v_star_0 is not None:
-                regrets.append(float(v_star_0 - total_reward))
+                regrets_value.append(float(v_star_0 - total_reward))
 
-        ret_mean = float(np.mean(returns)) if returns else 0.0
-        reg_mean = float(np.mean(regrets)) if regrets else None
+        # -------- Pass 2: GLFT episodes on identical randomness (policy returns) --------
+        glft_returns: List[float] = []
+        if self.glft is not None:
+            for seeds in episode_seeds:
+                _restore_seeds(seeds)
+                s = self.env.reset()
+                done = False
+                ret = 0.0
+                prev_s = None
 
-        # Optional logging
+                while not done:
+                    phase = s.get("phase", "C")
+
+                    if phase in ("continuous", "C", "clob"):
+                        q = int(s.get("inventory", 0))
+                        # Admissible actions at this step
+                        adm = self.actions.admissible(
+                            t=s["t"],
+                            obs=s,
+                            constraints={
+                                "inventory": q,
+                                "tau_open": self.env.cfg.tau_open,
+                                "tau_close": self.env.cfg.tau_close,
+                                "phase": phase,
+                            },
+                        )
+
+                        if q <= 0:
+                            # Prefer explicit no-trade if present; else pick largest delta (lowest fill prob)
+                            a_idx = None
+                            for idx in adm:
+                                act = self.actions.decode(idx)
+                                _, v = _extract_delta_and_volume(act)
+                                if v == 0:
+                                    a_idx = idx; break
+                            if a_idx is None:
+                                max_d = -1e18; pick = adm[0]
+                                for idx in adm:
+                                    act = self.actions.decode(idx)
+                                    d, _ = _extract_delta_and_volume(act)
+                                    if d is not None and d > max_d:
+                                        max_d, pick = d, idx
+                                a_idx = pick
+                        else:
+                            # δ* (currency) → ticks, then snap to nearest admissible action
+                            delta_cur = float(self.glft.delta_star(t=s["t"], q=q))
+                            delta_ticks = delta_cur / float(self.glft.alpha_tick)
+                            a_idx = _choose_idx_for_delta(delta_ticks_target=delta_ticks, q=q, adm_indices=adm)
+
+                        act_struct = self.actions.decode(a_idx)
+                        step = self.env.step(act_struct)
+                        ret += float(step.reward)
+
+                        prev_s = s
+                        s = step.next_state
+                        done = bool(step.done)
+
+                        # Enforce CLOB-only: stop at auction boundary and liquidate leftovers at S_T^mid
+                        phase_after = s.get("phase", phase)
+                        crossed = (phase in ("continuous","C","clob")) and (phase_after in ("auction","A"))
+                        ended_at_clob_end = done and (phase in ("continuous","C","clob"))
+                        if crossed or ended_at_clob_end:
+                            q_left = int(s.get("inventory", 0))
+                            if q_left > 0:
+                                S_mid_T = float((prev_s or s).get("mid", getattr(self.env.cfg, "initial_mid", 0.0)))
+                                ret += float(q_left) * S_mid_T
+                            break
+
+                    elif phase in ("auction", "A"):
+                        # Shouldn't happen—loop breaks at boundary above; ignore auction reward by design
+                        break
+
+                    else:
+                        # Unknown phase: safe no-op step if the env supports it
+                        step = self.env.step((0, 0, 0))
+                        s = step.next_state
+                        done = bool(step.done)
+
+                glft_returns.append(float(ret))
+
+        # -------- Aggregates & logging --------
+        ret_mean = float(np.mean(rl_returns)) if rl_returns else 0.0
+        reg_mean = float(np.mean(regrets_value)) if regrets_value else None
+        glft_mean = float(np.mean(glft_returns)) if glft_returns else None
+        gap_mean = (
+            float(np.mean([g - r for g, r in zip(glft_returns, rl_returns)]))
+            if glft_returns and rl_returns else None
+        )
+
         if self.logger is not None:
             try:
                 scal = {"eval_return_mean": ret_mean}
+                if glft_mean is not None:
+                    scal["eval_glft_return_mean"] = glft_mean
+                if gap_mean is not None:
+                    scal["eval_policy_gap_mean"] = gap_mean
                 if reg_mean is not None:
                     scal["eval_regret_mean"] = reg_mean
                 self.logger.log(step=self.global_step, scalars=scal)
             except Exception:
                 pass
 
-        return {"return_mean": ret_mean, **({"regret_mean": reg_mean} if reg_mean is not None else {})}
+        out = {"return_mean": ret_mean}
+        if glft_mean is not None:
+            out["glft_return_mean"] = glft_mean
+        if gap_mean is not None:
+            out["policy_gap_mean"] = gap_mean
+        if reg_mean is not None:
+            out["regret_mean"] = reg_mean
+        return out

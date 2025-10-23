@@ -116,7 +116,7 @@ class Auction:
         # --- Maker cancellation (remove a random maker) ---
         if rng.random() < float(params.get("p_cancel_mm", 0.0)) and state.supply_funcs:
             maker_id = rng.choice(list(state.supply_funcs.keys()))
-            del state.supply_funcs[maker_id]
+            state.supply_funcs[maker_id] = (0, 0)
             state.k_t = len(state.supply_funcs)
 
         # --- Taker arrivals on each side (observed volumes) ---

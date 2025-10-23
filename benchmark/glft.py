@@ -173,3 +173,141 @@ class GLFTBenchmark:
             if np.linalg.norm(incr, 1) <= self.eps * (np.linalg.norm(out, 1) + 1.0):
                 break
         return out
+
+
+# glft.py  (add near the end of the file)
+
+from typing import Sequence
+import random
+import numpy as np
+
+def run_glft_benchmark_episodes(env, glft, episode_seeds: Sequence[dict], *, stop_at_tauop: bool = True):
+    """
+    Replays len(episode_seeds) episodes with identical randomness,
+    using the GLFT policy on the CLOB and doing nothing in the auction.
+    If stop_at_tauop=True, the episode is considered ended at T (CLOB end),
+    leftover inventory is liquidated at S_T^mid, and auction rewards are ignored.
+
+    Returns: list[float] of episode returns (cumulated reward + forced liquidation).
+    """
+    bm_returns = []
+
+    def _normalize_step_out(out):
+        if not isinstance(out, tuple):
+            raise TypeError(f"env step returned non-tuple: {type(out)}")
+        n = len(out)
+        if n == 5:
+            s, r, terminated, truncated, info = out
+            return s, float(r), bool(terminated) or bool(truncated), info
+        if n == 4:
+            s, r, done, info = out
+            return s, float(r), bool(done), info
+        if n == 3:
+            s, r, done = out
+            return s, float(r), bool(done), {}
+        raise ValueError(f"Unsupported step return length {n}")
+
+    def _state_get_midprice(state):
+        # add/adjust keys to match your env
+        for k in ("mid", "mid_price", "S_mid", "mid_px", "price_mid"):
+            try:
+                if isinstance(state, dict) and k in state: return float(state[k])
+                if hasattr(state, k): return float(getattr(state, k))
+            except Exception:
+                pass
+        # fallback: env has a getter
+        for name in ("get_mid", "mid", "mid_price"):
+            fn = getattr(env, name, None)
+            if callable(fn):
+                try: return float(fn())
+                except Exception: pass
+        raise AttributeError("Cannot extract mid-price; add your key above.")
+
+    def _state_get_inventory(state):
+        for k in ("inv","inventory","I","q","qty","position"):
+            try:
+                if isinstance(state, dict) and k in state: return int(state[k])
+                if hasattr(state, k): return int(getattr(state, k))
+            except Exception:
+                pass
+        raise AttributeError("Cannot extract inventory; add your key above.")
+
+    def _build_auction_noop(env):
+        # (c_t, K_a, S_a) with zero vector c_t
+        n = 0
+        if hasattr(env, "agent_order_active") and env.agent_order_active is not None:
+            n = len(env.agent_order_active)
+        c_t = [0] * int(n)
+        return (0.0, 0.0, c_t)
+
+    for seeds in episode_seeds:
+        # restore PRNGs to replay exactly the same episode noise
+        random.setstate(seeds["py"])
+        np.random.set_state(seeds["np"])
+        try:
+            import torch
+            torch.random.set_rng_state(seeds["torch"])
+        except Exception:
+            pass
+
+        s = env.reset()
+        done = False
+        t_idx = 0
+        ret = 0.0
+        prev_s = None
+
+        while not done:
+            phase = getattr(env, "phase", "C")
+
+            if phase in ("continuous","C","clob"):
+                q = _state_get_inventory(s)
+                if q <= 0:
+                    # explicit no-trade action if you have one, else min volume & large delta
+                    action = (0.0, 0.0)  # adjust if your env expects an index
+                else:
+                    # choose delta* in TICKS and map to your (volume, delta_ticks) action here
+                    delta_ticks = glft.delta_star_ticks(t_idx, q)
+                    # example: (v=1, delta_ticks)
+                    action = (1.0, float(delta_ticks))
+
+                if hasattr(env, "step_clob"):
+                    s_next, r, done, info = _normalize_step_out(env.step_clob(action))
+                else:
+                    s_next, r, done, info = _normalize_step_out(env.step(action))
+
+                # Did we just leave the CLOB?
+                phase_after = getattr(env, "phase", phase)
+                crossed_to_auction = (phase in ("continuous","C","clob")) and (phase_after in ("auction","A"))
+                ended_at_clob_end = done and (phase in ("continuous","C","clob"))
+
+                ret += r
+                t_idx += 1
+
+                if crossed_to_auction or ended_at_clob_end:
+                    # Force liquidation of any leftover at S_T^mid (T is the last CLOB index).
+                    q_left = _state_get_inventory(s_next)
+                    if q_left > 0:
+                        S_mid_T = _state_get_midprice(prev_s if prev_s is not None else s_next)
+                        ret += float(q_left) * float(S_mid_T)
+                    if stop_at_tauop:
+                        break
+
+                prev_s = s_next
+                s = s_next
+
+            elif phase in ("auction","A"):
+                # no trading in the auction (theoretical benchmark)
+                noop = _build_auction_noop(env)
+                if hasattr(env, "step_auction"):
+                    s, r, done, info = _normalize_step_out(env.step_auction(noop))
+                else:
+                    s, r, done, info = _normalize_step_out(env.step(noop))
+                # ignore auction rewards to stay pure (don’t add r)
+
+            else:
+                # unknown phase: safe advance
+                s, r, done, info = _normalize_step_out(env.step((0.0,0.0,0.0)))
+
+        bm_returns.append(float(ret))
+
+    return bm_returns
