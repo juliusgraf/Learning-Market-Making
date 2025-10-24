@@ -101,6 +101,7 @@ def plot_episode(tr: EpisodeTracker, ep: int, tau_op: int, tau_cl: int, save_pat
 
     if save_path:
         plt.savefig(save_path, dpi=150)
+    plt.savefig("episode_{}.png".format(ep))
     plt.show()
 
 class MarketEmulator:
@@ -999,7 +1000,7 @@ class GLFTBenchmark:
 # ---------------------
 # Replay episodes with GLFT liquidation (CLOB only), no trading in auction
 # ---------------------
-def run_glft_benchmark_episodes(env, glft: GLFTBenchmark, episode_seeds, auction_actions=None, ignore_wrong_side=True, ignore_cancel=True):
+def run_glft_benchmark_episodes(env, glft: GLFTBenchmark, episode_seeds, auction_actions=None, ignore_wrong_side=False, ignore_cancel=False):
     """
     Replays len(episode_seeds) episodes with identical randomness,
     choosing GLFT actions in the CLOB and a no-op in the auction.
@@ -1145,19 +1146,19 @@ env = MarketEmulator(
     L=12, Lc=12, La=12,         # book depth & auction supply capacity
 
     # costs / penalties (tune to taste)
-    lambda_param=0.02,         # leftover inventory penalty weight for I^2
-    kappa=0.01,                  # concavity in revenue term (your f(·))
-    q=1.0,                      # wrong-side penalty weight
+    lambda_param=0.1,         # leftover inventory penalty weight for I^2
+    kappa=0.1,                  # concavity in revenue term (your f(·))
+    q=0.5,                      # wrong-side penalty weight
     d=0.05,                     # cancel cost
-    gamma=0.8,                  # smoothing for H_cl update
+    gamma=0.95,                  # smoothing for H_cl update
 
     # MO size distribution (used in both continuous & auction)
     v_m=5.0,                   # Pareto scale
-    pareto_gamma=2.2,           # Pareto tail index (2–3 = realistic-ish)
+    pareto_gamma=2.0,           # Pareto tail index (2–3 = realistic-ish)
     poisson_rate=1.5,           # MOs per side per unit time (≈3 total/sec)
-    sigma_mid=0.20,             # mid-price vol per sqrt(time); ~1 tick over 100 steps
+    sigma_mid=0.10,             # mid-price vol per sqrt(time); ~1 tick over 100 steps
     alpha=1.0,                  # tick size
-    seed=SEED,
+    seed=None,
 
     # book shape / L1 stats
     V_top_max=20.0,            # cap for L1 volume draws
@@ -1181,16 +1182,16 @@ AUCT_ACTIONS = [(K, off, cancel)
                 for off in S_OFFSETS
                 for cancel in (0, 1)]
 # Training tweaks
-EPISODES = 800
+EPISODES = 1500
 LR = 5e-3          # a bit smaller
-GAMMA = 0.995      # slightly longer credit
+GAMMA = 0.995     # slightly longer credit
 
 # ---------------------
 # GLFT params (tune/calibrate as you like)
 # ---------------------
 
-GLFT_A       = 0.9        # base hit intensity (arbitrary scale)
-GLFT_k       = 1.0        # per-currency decay; *effective* slope is k*alpha in ticks
+GLFT_A       = 1.0        # base hit intensity (arbitrary scale)
+GLFT_k       = 0.4        # per-currency decay; *effective* slope is k*alpha in ticks
 GLFT_gamma   = 0.0        # CARA risk aversion
 GLFT_sigma   = float(getattr(env, "sigma_mid", 0.2))        # per-step mid-price vol used in benchmark (match your env)
 GLFT_T       = int(getattr(env, "tau_op", 100)) - 1    # CLOB horizon; falls back to 100
@@ -1248,7 +1249,6 @@ class DQN(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, 128), nn.ReLU(),
-            nn.Linear(128, 128), nn.ReLU(),
             nn.Linear(128, 128), nn.ReLU(),
             nn.Linear(128, out_dim)
         )
@@ -1329,7 +1329,7 @@ auct_loss_per_ep = []
 # ---------------------
 PLOT_EVERY_EPISODE = True   # ← toggle
 SAVE_EP_FIGS = False        # set a path like f"plots/ep_{ep}.png" if you want files
-PLOT_EVERY_N = EPISODES          # 0/None disables the cadence filter
+PLOT_EVERY_N = 500          # 0/None disables the cadence filter
 
 # Collectors for regret analysis
 DQN_RETURNS = []
@@ -1555,6 +1555,7 @@ plt.bar(range(1, n+1), final_inventories)
 plt.axhline(0, color='k', lw=0.7)
 plt.title("Final inventory by episode")
 plt.xlabel("Episode"); plt.ylabel("Inventory at $\\tau^\mathrm{cl}$")
+plt.savefig("final_inventories.png")
 plt.tight_layout(); plt.show()
 
 # print("Final inventories:", final_inventories)
@@ -1573,6 +1574,7 @@ plt.title("DQN training loss per episode")
 plt.grid(True, alpha=0.3)
 plt.legend()
 plt.tight_layout()
+plt.savefig("dqn_training_loss.png")
 plt.show()
 
 print("Mean CLOB losses per episode:", [round(v, 6) for v in clob_loss_per_ep])
@@ -1608,6 +1610,7 @@ plt.ylabel("Cumulative pseudo-regret")
 plt.title("Regret analysis vs GLFT liquidation benchmark")
 plt.legend()
 plt.tight_layout()
+plt.savefig("dqn_vs_glft_regret.png")
 plt.show()
 
 # (Optional) Also inspect episode-wise returns
@@ -1619,34 +1622,52 @@ plt.ylabel("Return")
 plt.title("Episode returns: DQN vs GLFT")
 plt.legend()
 plt.tight_layout()
+plt.savefig("dqn_vs_glft_returns.png")
 plt.show()
 
 # =========================
-# Cesàro mean of returns (DQN vs GLFT)
+# Trailing-window mean of returns (DQN vs GLFT)
 # =========================
-# Align lengths to be absolutely safe
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Align lengths
 N = min(len(DQN_RETURNS), len(bm_returns))
 dqn_ret = np.asarray(DQN_RETURNS[:N], dtype=float)
 bm_ret  = np.asarray(bm_returns[:N], dtype=float)
 
-# Cesàro means (running averages)
-dqn_cesaro = np.cumsum(dqn_ret) / np.arange(1, N + 1, dtype=float)
-bm_cesaro  = np.cumsum(bm_ret)  / np.arange(1, N + 1, dtype=float)
+# Choose a window (feel free to tweak)
+WINDOW = max(10, min(30, N // 10))   # e.g., ~10% of run, bounded [10,30]
+
+def trailing_mean(x, w):
+    if N < w:
+        # not enough points: fallback to prefix means
+        return np.cumsum(x) / (np.arange(1, len(x)+1))
+    # simple moving average via cumulative sums (O(N))
+    cs = np.cumsum(np.insert(x, 0, 0.0))
+    sma = (cs[w:] - cs[:-w]) / float(w)
+    # pad the first w-1 points with the best available shorter averages
+    prefix = np.cumsum(x[:w-1]) / np.arange(1, w)
+    return np.concatenate([prefix, sma])
+
+dqn_avg = trailing_mean(dqn_ret, WINDOW)
+bm_avg  = trailing_mean(bm_ret,  WINDOW)
 
 plt.figure(figsize=(9, 4.5))
-plt.plot(range(1, N + 1), dqn_cesaro, label="DQN Cesàro mean", linewidth=2)
-plt.plot(range(1, N + 1), bm_cesaro,  label="GLFT Cesàro mean", linestyle="--", linewidth=2)
+plt.plot(range(1, N + 1), dqn_avg, label=f"DQN {WINDOW}-episode avg", linewidth=2)
+plt.plot(range(1, N + 1), bm_avg,  label=f"GLFT {WINDOW}-episode avg", linestyle="--", linewidth=2)
 
-# Optional: horizontal lines for final means
-plt.axhline(dqn_cesaro[-1], linestyle=":", linewidth=1, label=f"DQN final mean = {dqn_cesaro[-1]:.2f}")
-plt.axhline(bm_cesaro[-1],  linestyle=":", linewidth=1, label=f"GLFT final mean = {bm_cesaro[-1]:.2f}")
+# Horizontal lines for the *last* window average only
+plt.axhline(dqn_avg[-1], linestyle=":", linewidth=1,
+            label=f"DQN last {WINDOW} avg = {dqn_avg[-1]:.2f}")
+plt.axhline(bm_avg[-1],  linestyle=":", linewidth=1,
+            label=f"GLFT last {WINDOW} avg = {bm_avg[-1]:.2f}")
 
-plt.title("Cesàro Mean of Episode Returns (Convergence View)")
+plt.title(f"Trailing Mean of Episode Returns (window={WINDOW})")
 plt.xlabel("Episode")
-plt.ylabel("Running Average Return")
+plt.ylabel(f"Mean Return over last {WINDOW} episodes")
 plt.legend(loc="best")
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
+plt.savefig("dqn_vs_glft_trailing_mean_returns.png")
 plt.show()
-
-print(bm_returns)
