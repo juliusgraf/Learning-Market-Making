@@ -8,13 +8,14 @@ from collections import defaultdict
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from typing import Optional
+import copy
 
 from dataclasses import dataclass, field
 
-try:
-    plt.rcParams['text.usetex'] = True
-except Exception:
-    plt.rcParams['text.usetex'] = False
+# try:
+#     plt.rcParams['text.usetex'] = True
+# except Exception:
+#     plt.rcParams['text.usetex'] = False
 
 @dataclass
 @dataclass
@@ -106,10 +107,11 @@ def plot_episode(tr: EpisodeTracker, ep: int, tau_op: int, tau_cl: int, save_pat
 
 class MarketEmulator:
     def __init__(self, tau_op=100, tau_cl=120, I=100, V=5000, L=10, Lc=8, La=5,
-                 lambda_param=0.005, kappa=0.1, q=1.0, d=1.0, gamma=0.5, 
-                 v_m=1000, pareto_gamma=2.0, poisson_rate=0.5, sigma_mid=1.0, seed=None,
-                 V_top_max=50000.0, lambda_decision=1.0, alpha=1.0, beta_a=2.0, beta_b=5.0, 
-                 depth_decay=0.6, price_band_ticks=5.0):
+             lambda_param=0.005, kappa=0.1, q=1.0, d=1.0, gamma=0.5, 
+             v_m=1000, pareto_gamma=2.0, poisson_rate=0.5, sigma_mid=1.0, seed=None,
+             V_top_max=50000.0, lambda_decision=1.0, alpha=1.0, beta_a=2.0, beta_b=5.0, 
+             depth_decay=0.6, price_band_ticks=5.0,
+             L_max_auction=100):
         """
         Initialize the market emulator with given parameters.
         """
@@ -123,7 +125,8 @@ class MarketEmulator:
         self.tau_cl = tau_cl
         self.I_max = I
         self.V_max = V
-        self.L_max = L
+        self.L_max_clob = L  # Max depth during CLOB phase (book depth)
+        self.L_max = L_max_auction  # Max number of market orders during auction
         self.Lc = Lc
         self.La = La
         self.lambda_param = lambda_param
@@ -1140,62 +1143,63 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
 # Create env (stable-ish defaults)
 env = MarketEmulator(
-    tau_op=100, tau_cl=150,     # 100 discrete “seconds” of CLOB, 50 ticks of auction
+    tau_op=120, tau_cl=150,     # 100 discrete “seconds” of CLOB, 50 ticks of auction
     I=100,                     # inventory cap
     V=30,                      # hard cap per order (both agent & exo MOs)
-    L=12, Lc=12, La=12,         # book depth & auction supply capacity
+    L=12, Lc=12, La=12,
+    L_max_auction=100,        # book depth & auction supply capacity
 
     # costs / penalties (tune to taste)
-    lambda_param=0.1,         # leftover inventory penalty weight for I^2
+    lambda_param=0.2,         # leftover inventory penalty weight for I^2
     kappa=0.1,                  # concavity in revenue term (your f(·))
     q=0.5,                      # wrong-side penalty weight
     d=0.05,                     # cancel cost
     gamma=0.95,                  # smoothing for H_cl update
 
     # MO size distribution (used in both continuous & auction)
-    v_m=5.0,                   # Pareto scale
-    pareto_gamma=2.0,           # Pareto tail index (2–3 = realistic-ish)
-    poisson_rate=1.5,           # MOs per side per unit time (≈3 total/sec)
+    v_m=2.0,                   # Pareto scale
+    pareto_gamma=2.5,           # Pareto tail index (2–3 = realistic-ish)
+    poisson_rate=0.5,           # MOs per side per unit time (≈3 total/sec)
     sigma_mid=0.10,             # mid-price vol per sqrt(time); ~1 tick over 100 steps
     alpha=1.0,                  # tick size
     seed=None,
 
     # book shape / L1 stats
-    V_top_max=20.0,            # cap for L1 volume draws
+    V_top_max=15.0,            # cap for L1 volume draws
     beta_a=2.0, beta_b=5.0,     # skew toward smaller L1
     depth_decay=0.5,            # geometric decay per level (ρ)
     price_band_ticks=5.0        # auction supply centers within ±5 ticks
 )
 
-
 # Actions: smaller steps
-V_CHOICES = np.array([0, 0.1, 0.2, 0.4, 0.7, 1.0]) * env.V_max
-DELTA_CHOICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # in ticks
+# V_CHOICES = np.array([0, 0.1, 0.2, 0.4, 0.7, 1.0]) * env.V_max
+V_CHOICES = np.array([0, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0]) * env.V_max
+DELTA_CHOICES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15]
 CLOB_ACTIONS = [(0.0, 0)] + [(v, d) for v in V_CHOICES[1:] for d in DELTA_CHOICES]
 
 STEPS_AUCT = max(1, env.tau_cl - env.tau_op)
-K_MAX = 2.0 * env.I_max / STEPS_AUCT # enough slope to clear over the horizon
-K_CHOICES = [0.0] + list(np.linspace(0.5, K_MAX, 8)) # Encourage being on the sell side at the close
-S_OFFSETS = [-4, -3, -2, -1, 0]
+K_MAX = 8.0 * env.I_max / STEPS_AUCT # enough slope to clear over the horizon
+K_CHOICES = [0.0] + list(np.linspace(1.0, K_MAX, 10)) # Encourage being on the sell side at the close
+S_OFFSETS = [-12, -10, -8, -6, -4, -2, 0, 2, 4]
 AUCT_ACTIONS = [(K, off, cancel) 
                 for K in K_CHOICES
                 for off in S_OFFSETS
                 for cancel in (0, 1)]
 # Training tweaks
-EPISODES = 1500
-LR = 5e-3          # a bit smaller
-GAMMA = 0.995     # slightly longer credit
+EPISODES = 10000
+LR = 4e-3          # a bit smaller
+GAMMA = 0.998     # slightly longer credit
 
 # ---------------------
 # GLFT params (tune/calibrate as you like)
 # ---------------------
 
-GLFT_A       = 1.0        # base hit intensity (arbitrary scale)
-GLFT_k       = 0.4        # per-currency decay; *effective* slope is k*alpha in ticks
+GLFT_A       = 0.5        # base hit intensity (arbitrary scale)
+GLFT_k       = 0.5        # per-currency decay; *effective* slope is k*alpha in ticks
 GLFT_gamma   = 0.0        # CARA risk aversion
 GLFT_sigma   = float(getattr(env, "sigma_mid", 0.2))        # per-step mid-price vol used in benchmark (match your env)
 GLFT_T       = int(getattr(env, "tau_op", 100)) - 1    # CLOB horizon; falls back to 100
-GLFT_I_MAX   = int(getattr(env, "I", 1000))           # inventory cap I
+GLFT_I_MAX   = int(getattr(env, "I_max", 1000))           # inventory cap I
 GLFT_ALPHA   = float(getattr(env, "alpha", 1.0))    # tick size
 
 glft_params = GLFTParams(
@@ -1248,9 +1252,9 @@ class DQN(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 128), nn.ReLU(),
-            nn.Linear(128, 128), nn.ReLU(),
-            nn.Linear(128, out_dim)
+            nn.Linear(in_dim, 50), nn.ReLU(),
+            nn.Linear(50, 50), nn.ReLU(),
+            nn.Linear(50, out_dim)
         )
     def forward(self, x):
         return self.net(x)
@@ -1262,6 +1266,10 @@ clob_target = DQN(in_dim=8, out_dim=len(CLOB_ACTIONS)).to(DEVICE)
 auct_target = DQN(in_dim=7, out_dim=len(AUCT_ACTIONS)).to(DEVICE)
 clob_target.load_state_dict(clob_net.state_dict()); clob_target.eval()
 auct_target.load_state_dict(auct_net.state_dict()); auct_target.eval()
+
+print("Saving initial (untrained) network states...")
+initial_clob_net_state = copy.deepcopy(clob_net.state_dict())
+initial_auct_net_state = copy.deepcopy(auct_net.state_dict())
 
 def soft_update(target, source, tau=0.01):
     with torch.no_grad():
@@ -1275,10 +1283,19 @@ REWARD_SCALE = 1e-3  # scale down rewards by 1000
 mse = nn.SmoothL1Loss()  # Huber
 
 # ε-greedy schedule
-def epsilon_by_episode(ep, start=1.0, end=0.05, total=EPISODES):
+#def epsilon_by_episode(ep, start=1.0, end=0.02, total=EPISODES):
+#    if total <= 1: return end
+#    frac = ep / (total - 1)
+#    return start + (end - start) * frac
+
+def epsilon_by_episode(ep, start=1.0, end=0.02, total=EPISODES, warmup=100):
     if total <= 1: return end
-    frac = ep / (total - 1)
-    return start + (end - start) * frac
+    if ep < warmup:
+        # Linear warmup from start
+        return start
+    # Exponential decay after warmup
+    decay_rate = -np.log(end / start) / (total - warmup)
+    return start * np.exp(-decay_rate * (ep - warmup))
 
 # ---------------------
 # Storage for plots 
@@ -1329,7 +1346,7 @@ auct_loss_per_ep = []
 # ---------------------
 PLOT_EVERY_EPISODE = True   # ← toggle
 SAVE_EP_FIGS = False        # set a path like f"plots/ep_{ep}.png" if you want files
-PLOT_EVERY_N = 500          # 0/None disables the cadence filter
+PLOT_EVERY_N = 2500          # 0/None disables the cadence filter
 
 # Collectors for regret analysis
 DQN_RETURNS = []
@@ -1341,14 +1358,22 @@ N_EVAL_EPISODES = 32
 # EVAL_SEEDS = EPISODE_SEEDS[:N_EVAL_EPISODES]
 eval_returns = []  # collect eval curve you’ll plot
 
-MASTER_SEED = 123456
-EVAL_MASTER_SEED = 424242
+MASTER_SEED = 42
+EVAL_MASTER_SEED = 120
 
 _rng_train = np.random.default_rng(MASTER_SEED)
 EPISODE_SEEDS = _rng_train.integers(0, 2**32 - 1, size=EPISODES, dtype=np.uint32).tolist()
 
 _rng_eval = np.random.default_rng(EVAL_MASTER_SEED)
 EVAL_SEEDS = _rng_eval.integers(0, 2**32 - 1, size=N_EVAL_EPISODES, dtype=np.uint32).tolist()
+
+FINAL_EVAL_MASTER_SEED = 200
+N_FINAL_EVAL_EPISODES = 100
+
+_rng_final_eval = np.random.default_rng(FINAL_EVAL_MASTER_SEED)
+FINAL_EVAL_SEEDS = _rng_final_eval.integers(0, 2**32 - 1, size=N_FINAL_EVAL_EPISODES, dtype=np.uint32).tolist()
+
+print(f"\nGenerated {N_FINAL_EVAL_EPISODES} fresh evaluation seeds")
 
 for ep in range(EPISODES):
     seed = int(EPISODE_SEEDS[ep])
@@ -1580,12 +1605,44 @@ plt.show()
 print("Mean CLOB losses per episode:", [round(v, 6) for v in clob_loss_per_ep])
 print("Mean Auction losses per episode:", [round(v, 6) for v in auct_loss_per_ep])
 
-plt.figure(figsize=(7,4))
-n = len(eval_returns)
-plt.plot(range(1, n+1), eval_returns, marker='o')
-plt.title("Evaluation return ($\\varepsilon = 0$) vs episode")
-plt.xlabel("Episode"); plt.ylabel("Total return")
-plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
+# ---------------------
+# Plot evaluation returns vs GLFT benchmark
+# ---------------------
+# Compute GLFT benchmark returns at evaluation points
+glft_eval_returns = []
+for i in range(len(eval_returns)):
+    if (i + 1) % EVAL_INTERVAL == 0:
+        # Get the episode indices for this evaluation point
+        ep_end = i + 1
+        ep_start = max(0, ep_end - N_EVAL_EPISODES)
+        eval_ep_seeds = EPISODE_SEEDS[ep_start:ep_end]
+        
+        # Run GLFT benchmark on these episodes
+        bm_ret = run_glft_benchmark_episodes(
+            env, glft, eval_ep_seeds, 
+            auction_actions=None,
+            ignore_wrong_side=False,
+            ignore_cancel=False
+        )
+        glft_eval_returns.append(np.mean(bm_ret))
+    else:
+        # Carry forward previous value
+        glft_eval_returns.append(glft_eval_returns[-1] if glft_eval_returns else np.nan)
+        
+
+
+plt.figure(figsize=(7, 4))
+plt.plot(range(1, len(eval_returns) + 1), eval_returns, marker='o', label='DQN (greedy eval)', alpha=0.8)
+plt.plot(range(1, len(glft_eval_returns) + 1), glft_eval_returns, marker='s', label='GLFT benchmark', alpha=0.8, linestyle='--')
+plt.axhline(0, color='k', lw=0.7, linestyle=':')
+plt.title("Evaluation returns: DQN vs GLFT benchmark")
+plt.xlabel("Episode")
+plt.ylabel("Mean return (greedy policy)")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("eval_returns_vs_benchmark.png")
+plt.show()
 
 # ---------------------
 # Evaluate GLFT on the same episodes, then compute & plot pseudo-regret
@@ -1628,8 +1685,6 @@ plt.show()
 # =========================
 # Trailing-window mean of returns (DQN vs GLFT)
 # =========================
-import numpy as np
-import matplotlib.pyplot as plt
 
 # Align lengths
 N = min(len(DQN_RETURNS), len(bm_returns))
@@ -1637,7 +1692,7 @@ dqn_ret = np.asarray(DQN_RETURNS[:N], dtype=float)
 bm_ret  = np.asarray(bm_returns[:N], dtype=float)
 
 # Choose a window (feel free to tweak)
-WINDOW = max(10, min(30, N // 10))   # e.g., ~10% of run, bounded [10,30]
+WINDOW = max(10, min(400, N // 10))   # e.g., ~10% of run, bounded [10,100]
 
 def trailing_mean(x, w):
     if N < w:
@@ -1671,3 +1726,320 @@ plt.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig("dqn_vs_glft_trailing_mean_returns.png")
 plt.show()
+
+def evaluate_policy(env, clob_net, auct_net, eval_seeds, policy_name="Policy"):
+    """
+    Evaluate a policy on given seeds with detailed statistics.
+    Returns: dict with returns, inventory stats, and per-phase rewards
+    """
+    print(f"\nEvaluating {policy_name} on {len(eval_seeds)} episodes...")
+    
+    returns = []
+    final_inventories = []
+    clob_rewards = []
+    auction_rewards = []
+    
+    for i, seed in enumerate(eval_seeds):
+        if (i + 1) % 10 == 0:
+            print(f"  Progress: {i+1}/{len(eval_seeds)}")
+        
+        s = env.reset(seed=int(seed))
+        done = False
+        total_r = 0.0
+        clob_r = 0.0
+        auction_r = 0.0
+        
+        while not done:
+            if env.phase == 'continuous':
+                x = feat_clob(s, env).unsqueeze(0)
+                with torch.no_grad():
+                    a_idx = int(torch.argmax(clob_net(x)[0]).item())
+                v, delta = CLOB_ACTIONS[a_idx]
+                v = min(v, s['X1'])
+                s, r, done = env.step((v, delta))
+                clob_r += r
+            else:  # auction
+                x = feat_auction(s, env).unsqueeze(0)
+                with torch.no_grad():
+                    a_idx = int(torch.argmax(auct_net(x)[0]).item())
+                K, off, cancel = AUCT_ACTIONS[a_idx]
+                S = s['X10'] + off * env.alpha
+                if cancel:
+                    c_vec = [0]*(env.tau_cl+1)
+                    t = int(s['time'])
+                    for s_cancel in range(env.tau_op, t):
+                        c_vec[s_cancel] = 1
+                else:
+                    c_vec = [0]*(env.tau_cl+1)
+                s, r, done = env.step((K, S, c_vec))
+                auction_r += r
+            
+            total_r += r
+        
+        returns.append(total_r)
+        final_inventories.append(env.inventory)
+        clob_rewards.append(clob_r)
+        auction_rewards.append(auction_r)
+    
+    return {
+        'returns': np.array(returns),
+        'inventories': np.array(final_inventories),
+        'clob_rewards': np.array(clob_rewards),
+        'auction_rewards': np.array(auction_rewards),
+        'mean_return': np.mean(returns),
+        'std_return': np.std(returns),
+        'median_return': np.median(returns),
+        'mean_inventory': np.mean(final_inventories),
+        'mean_clob_reward': np.mean(clob_rewards),
+        'mean_auction_reward': np.mean(auction_rewards)
+    }
+
+# ---------------------
+# 4. Evaluate GLFT benchmark
+# ---------------------
+print("\n" + "="*70)
+print("POST-TRAINING EVALUATION")
+print("="*70)
+
+print("\n[1/3] Evaluating GLFT Benchmark...")
+glft_results = run_glft_benchmark_episodes(
+    env, glft, FINAL_EVAL_SEEDS, 
+    auction_actions=None,
+    ignore_wrong_side=False,
+    ignore_cancel=False
+)
+
+glft_stats = {
+    'returns': np.array(glft_results),
+    'mean_return': np.mean(glft_results),
+    'std_return': np.std(glft_results),
+    'median_return': np.median(glft_results)
+}
+
+# ---------------------
+# 5. Evaluate final (trained) DQN
+# ---------------------
+print("\n[2/3] Evaluating Final (Trained) DQN...")
+final_dqn_stats = evaluate_policy(env, clob_net, auct_net, FINAL_EVAL_SEEDS, "Final DQN")
+
+# ---------------------
+# 6. Evaluate initial (untrained) DQN
+# ---------------------
+print("\n[3/3] Evaluating Initial (Untrained) DQN...")
+
+# Create temporary networks and load initial states
+initial_clob_net = DQN(in_dim=8, out_dim=len(CLOB_ACTIONS)).to(DEVICE)
+initial_auct_net = DQN(in_dim=7, out_dim=len(AUCT_ACTIONS)).to(DEVICE)
+initial_clob_net.load_state_dict(initial_clob_net_state)
+initial_auct_net.load_state_dict(initial_auct_net_state)
+initial_clob_net.eval()
+initial_auct_net.eval()
+
+initial_dqn_stats = evaluate_policy(env, initial_clob_net, initial_auct_net, 
+                                     FINAL_EVAL_SEEDS, "Initial DQN")
+
+# ---------------------
+# 7. Print comparison table
+# ---------------------
+print("\n" + "="*70)
+print("EVALUATION RESULTS SUMMARY")
+print("="*70)
+
+print(f"\n{'Metric':<30} {'Initial DQN':<15} {'Final DQN':<15} {'GLFT':<15}")
+print("-" * 70)
+print(f"{'Mean Return':<30} {initial_dqn_stats['mean_return']:>14.1f} {final_dqn_stats['mean_return']:>14.1f} {glft_stats['mean_return']:>14.1f}")
+print(f"{'Std Return':<30} {initial_dqn_stats['std_return']:>14.1f} {final_dqn_stats['std_return']:>14.1f} {glft_stats['std_return']:>14.1f}")
+print(f"{'Median Return':<30} {initial_dqn_stats['median_return']:>14.1f} {final_dqn_stats['median_return']:>14.1f} {glft_stats['median_return']:>14.1f}")
+print(f"{'Mean Final Inventory':<30} {initial_dqn_stats['mean_inventory']:>14.2f} {final_dqn_stats['mean_inventory']:>14.2f} {'N/A':<15}")
+print(f"{'Mean CLOB Reward':<30} {initial_dqn_stats['mean_clob_reward']:>14.1f} {final_dqn_stats['mean_clob_reward']:>14.1f} {'N/A':<15}")
+print(f"{'Mean Auction Reward':<30} {initial_dqn_stats['mean_auction_reward']:>14.1f} {final_dqn_stats['mean_auction_reward']:>14.1f} {'N/A':<15}")
+
+print("\n" + "-" * 70)
+print("RELATIVE IMPROVEMENTS")
+print("-" * 70)
+
+improvement_vs_initial = 100 * (final_dqn_stats['mean_return'] / initial_dqn_stats['mean_return'] - 1)
+improvement_vs_glft = 100 * (final_dqn_stats['mean_return'] / glft_stats['mean_return'] - 1)
+
+print(f"Final DQN vs Initial DQN:     {improvement_vs_initial:>+6.1f}%")
+print(f"Final DQN vs GLFT:            {improvement_vs_glft:>+6.1f}%")
+print(f"GLFT vs Initial DQN:          {100*(glft_stats['mean_return']/initial_dqn_stats['mean_return']-1):>+6.1f}%")
+
+# Statistical significance (t-test)
+from scipy import stats
+
+t_stat_final_vs_glft, p_val_final_vs_glft = stats.ttest_ind(
+    final_dqn_stats['returns'], glft_stats['returns']
+)
+t_stat_final_vs_initial, p_val_final_vs_initial = stats.ttest_ind(
+    final_dqn_stats['returns'], initial_dqn_stats['returns']
+)
+
+print("\n" + "-" * 70)
+print("STATISTICAL SIGNIFICANCE (Two-sample t-test)")
+print("-" * 70)
+print(f"Final DQN vs GLFT:     t={t_stat_final_vs_glft:>6.2f}, p={p_val_final_vs_glft:.4f} {'***' if p_val_final_vs_glft < 0.001 else '**' if p_val_final_vs_glft < 0.01 else '*' if p_val_final_vs_glft < 0.05 else 'ns'}")
+print(f"Final DQN vs Initial:  t={t_stat_final_vs_initial:>6.2f}, p={p_val_final_vs_initial:.4f} {'***' if p_val_final_vs_initial < 0.001 else '**' if p_val_final_vs_initial < 0.01 else '*' if p_val_final_vs_initial < 0.05 else 'ns'}")
+
+# ---------------------
+# 8. Visualization
+# ---------------------
+
+# Plot 1: Return distributions (violin plots)
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Left: Box plots with individual points
+ax = axes[0]
+data_to_plot = [initial_dqn_stats['returns'], final_dqn_stats['returns'], glft_stats['returns']]
+positions = [1, 2, 3]
+labels = ['Initial\nDQN', 'Final\nDQN', 'GLFT']
+
+bp = ax.boxplot(data_to_plot, positions=positions, widths=0.5, patch_artist=True,
+                showmeans=True, meanline=True,
+                boxprops=dict(facecolor='lightblue', alpha=0.7),
+                medianprops=dict(color='red', linewidth=2),
+                meanprops=dict(color='green', linewidth=2, linestyle='--'))
+
+# Add scattered points with jitter
+for i, (data, pos) in enumerate(zip(data_to_plot, positions)):
+    y = data
+    x = np.random.normal(pos, 0.04, size=len(y))
+    ax.plot(x, y, 'o', alpha=0.3, markersize=4, color='navy')
+
+ax.set_xticks(positions)
+ax.set_xticklabels(labels)
+ax.set_ylabel('Episode Return', fontsize=12)
+ax.set_title('Return Distributions', fontsize=14)
+ax.grid(True, alpha=0.3, axis='y')
+ax.axhline(0, color='black', linewidth=0.8, linestyle=':')
+
+# Right: Histogram comparison
+ax = axes[1]
+bins = np.linspace(
+    min(initial_dqn_stats['returns'].min(), final_dqn_stats['returns'].min(), glft_stats['returns'].min()),
+    max(initial_dqn_stats['returns'].max(), final_dqn_stats['returns'].max(), glft_stats['returns'].max()),
+    30
+)
+
+ax.hist(initial_dqn_stats['returns'], bins=bins, alpha=0.5, label='Initial DQN', density=True, color='red')
+ax.hist(final_dqn_stats['returns'], bins=bins, alpha=0.5, label='Final DQN', density=True, color='blue')
+ax.hist(glft_stats['returns'], bins=bins, alpha=0.5, label='GLFT', density=True, color='orange')
+
+ax.axvline(initial_dqn_stats['mean_return'], color='red', linestyle='--', linewidth=2, alpha=0.7)
+ax.axvline(final_dqn_stats['mean_return'], color='blue', linestyle='--', linewidth=2, alpha=0.7)
+ax.axvline(glft_stats['mean_return'], color='orange', linestyle='--', linewidth=2, alpha=0.7)
+
+ax.set_xlabel('Episode Return', fontsize=12)
+ax.set_ylabel('Density', fontsize=12)
+ax.set_title('Return Distribution Density', fontsize=14)
+ax.legend(fontsize=10)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("final_evaluation_distributions.png", dpi=150)
+plt.show()
+
+# Plot 2: Bar chart with error bars
+fig, ax = plt.subplots(figsize=(10, 6))
+
+policies = ['Initial DQN', 'Final DQN', 'GLFT']
+means = [initial_dqn_stats['mean_return'], final_dqn_stats['mean_return'], glft_stats['mean_return']]
+stds = [initial_dqn_stats['std_return'], final_dqn_stats['std_return'], glft_stats['std_return']]
+colors = ['red', 'blue', 'orange']
+
+x_pos = np.arange(len(policies))
+bars = ax.bar(x_pos, means, yerr=stds, capsize=10, alpha=0.7, color=colors, 
+               edgecolor='black', linewidth=1.5)
+
+# Add value labels on bars
+for i, (bar, mean, std) in enumerate(zip(bars, means, stds)):
+    height = bar.get_height()
+    ax.text(bar.get_x() + bar.get_width()/2., height + std + 100,
+            f'{mean:.0f}\n±{std:.0f}',
+            ha='center', va='bottom', fontsize=11)
+
+ax.set_xticks(x_pos)
+ax.set_xticklabels(policies, fontsize=12)
+ax.set_ylabel('Mean Episode Return', fontsize=13)
+ax.set_title('Post-Training Policy Comparison', fontsize=15)
+ax.grid(True, alpha=0.3, axis='y')
+ax.axhline(0, color='black', linewidth=1, linestyle=':')
+
+plt.tight_layout()
+plt.savefig("final_evaluation_comparison.png", dpi=150)
+plt.show()
+
+# Plot 3: Phase-wise reward breakdown (Final DQN only)
+fig, ax = plt.subplots(figsize=(10, 6))
+
+phase_labels = ['CLOB Phase', 'Auction Phase', 'Total']
+final_values = [
+    final_dqn_stats['mean_clob_reward'],
+    final_dqn_stats['mean_auction_reward'],
+    final_dqn_stats['mean_return']
+]
+initial_values = [
+    initial_dqn_stats['mean_clob_reward'],
+    initial_dqn_stats['mean_auction_reward'],
+    initial_dqn_stats['mean_return']
+]
+
+x_pos = np.arange(len(phase_labels))
+width = 0.35
+
+bars1 = ax.bar(x_pos - width/2, initial_values, width, label='Initial DQN', alpha=0.7, color='red')
+bars2 = ax.bar(x_pos + width/2, final_values, width, label='Final DQN', alpha=0.7, color='blue')
+
+# Add value labels
+for bars in [bars1, bars2]:
+    for bar in bars:
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.0f}',
+                ha='center', va='bottom' if height > 0 else 'top', fontsize=10)
+
+ax.set_xticks(x_pos)
+ax.set_xticklabels(phase_labels, fontsize=12)
+ax.set_ylabel('Mean Reward', fontsize=13)
+ax.set_title('Phase-wise Reward Breakdown', fontsize=15)
+ax.legend(fontsize=11)
+ax.grid(True, alpha=0.3, axis='y')
+ax.axhline(0, color='black', linewidth=1, linestyle=':')
+
+plt.tight_layout()
+plt.savefig("final_evaluation_phase_breakdown.png", dpi=150)
+plt.show()
+
+# Plot 4: Final inventory distribution (DQN only)
+fig, ax = plt.subplots(figsize=(10, 6))
+
+bins_inv = np.linspace(
+    min(initial_dqn_stats['inventories'].min(), final_dqn_stats['inventories'].min()),
+    max(initial_dqn_stats['inventories'].max(), final_dqn_stats['inventories'].max()),
+    30
+)
+
+ax.hist(initial_dqn_stats['inventories'], bins=bins_inv, alpha=0.6, 
+        label=f"Initial DQN (mean={initial_dqn_stats['mean_inventory']:.2f})", 
+        color='red', edgecolor='black')
+ax.hist(final_dqn_stats['inventories'], bins=bins_inv, alpha=0.6, 
+        label=f"Final DQN (mean={final_dqn_stats['mean_inventory']:.2f})", 
+        color='blue', edgecolor='black')
+
+ax.axvline(initial_dqn_stats['mean_inventory'], color='red', linestyle='--', linewidth=2)
+ax.axvline(final_dqn_stats['mean_inventory'], color='blue', linestyle='--', linewidth=2)
+ax.axvline(0, color='green', linestyle=':', linewidth=2, label='Perfect liquidation')
+
+ax.set_xlabel('Final Inventory at $\\tau^{\\mathrm{cl}}$', fontsize=12)
+ax.set_ylabel('Frequency', fontsize=12)
+ax.set_title('Final Inventory Distribution', fontsize=14)
+ax.legend(fontsize=10)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("final_evaluation_inventory.png", dpi=150)
+plt.show()
+
+print("\n" + "="*70)
+print("Evaluation complete! Plots saved.")
+print("="*70)
