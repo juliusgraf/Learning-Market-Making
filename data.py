@@ -1549,6 +1549,9 @@ def train_and_evaluate_one_asset(
             print(f"Episode {ep+1}/{episodes} | Eval Return: {eval_r:.2f} | Epsilon: {eps:.3f}")
         else:
             eval_returns.append(eval_returns[-1] if len(eval_returns) else np.nan)
+            
+        soft_update(clob_net, clob_target, tau=0.01)
+        soft_update(auct_net, auct_target, tau=0.01)
 
     p = np.asarray(env.mid_price_path, dtype=float)
     r = np.diff(np.log(p))
