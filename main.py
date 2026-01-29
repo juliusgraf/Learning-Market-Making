@@ -554,8 +554,8 @@ class MarketEmulator:
             self.last_executed = E_t
             self.inventory = float(np.clip(self.inventory, -self.I_max, self.I_max))
 
-            dt = max(0.0, target_time - last_time)   # usually 1.0
-            dt_phys  = dt * self.dt                  # seconds
+            dt = max(0.0, target_time - last_time)
+            dt_phys  = dt * self.dt
 
             self.current_time = float(target_time)
             self.last_action_time = self.current_time
@@ -885,14 +885,6 @@ class ASBenchmark:
         return idx
     
 class TWAPBenchmark:
-    """Simple TWAP liquidation benchmark on the CLOB (continuous) phase.
-
-    At each decision time, it targets selling the remaining inventory evenly over the remaining
-    CLOB steps. Orders are placed at a fixed spread (delta) snapped to the discrete CLOB action grid.
-
-    The auction phase handling is implemented in the benchmark runner (same heuristic as the AS runner).
-    """
-
     def __init__(
         self,
         params: ASParams,
@@ -905,14 +897,12 @@ class TWAPBenchmark:
         self.clob_actions = list(clob_actions)
         self.q_name = q_name_in_state
 
-        # Allowed actions: positive volume only
         self.allowed_clob = [(i, a) for i, a in enumerate(self.clob_actions) if a[0] > 0]
         if len(self.allowed_clob) == 0:
             raise ValueError("TWAPBenchmark: no CLOB actions with positive volume available.")
 
         self.delta_grid = np.array([a[1] for _, a in self.allowed_clob], dtype=float)
 
-        # Pick delta (in ticks) used during CLOB phase
         if twap_delta_ticks is not None:
             j = int(np.argmin(np.abs(self.delta_grid - float(twap_delta_ticks))))
             _, (_, d) = self.allowed_clob[j]
@@ -921,7 +911,6 @@ class TWAPBenchmark:
             if str(delta_mode).lower() == "max":
                 self.twap_delta = float(np.max(self.delta_grid))
             else:
-                # default: most aggressive (smallest delta -> higher execution intensity)
                 self.twap_delta = float(np.min(self.delta_grid))
 
     def _state_get_inventory(self, s, env=None):
@@ -964,34 +953,26 @@ class TWAPBenchmark:
     def choose_clob_action_index(self, s, t_idx, env=None):
         q = self._state_get_inventory(s, env=env)
 
-        # No inventory: submit 0-volume action if possible
         if q <= 0:
             for i, a in enumerate(self.clob_actions):
                 if a[0] == 0:
                     return i
-            # fallback: widest delta (least likely to execute)
             i, _ = max(self.allowed_clob, key=lambda p: p[1][1])
             return i
 
-        # Remaining time steps in CLOB phase
         t_idx = int(np.clip(int(t_idx), 0, self.p.T))
         steps_left = max(1, (self.p.T - t_idx + 1))
 
-        # TWAP target volume for this step
         target_vol = int(math.ceil(q / float(steps_left)))
         target_vol = max(1, min(target_vol, q))
 
-        # Candidate actions at TWAP delta and feasible volume
         candidates = [(i, a) for i, a in self.allowed_clob if a[1] == self.twap_delta and a[0] <= q]
         if not candidates:
-            # If exact-delta candidates don't exist, fall back to any feasible volume
             candidates = [(i, a) for i, a in self.allowed_clob if a[0] <= q]
         if not candidates:
-            # Last resort: smallest positive volume action
             i, _ = min(self.allowed_clob, key=lambda p: p[1][0])
             return i
 
-        # Choose the volume closest to target; tiebreak towards larger volume
         def score(item):
             i, (v, d) = item
             return (abs(float(v) - float(target_vol)), -float(v))
@@ -1094,10 +1075,6 @@ def run_glft_benchmark_episodes(env, glft: ASBenchmark, episode_seeds, auction_a
     return bm_returns
 
 def run_twap_benchmark_episodes(env, twap: TWAPBenchmark, episode_seeds, auction_actions=None, ignore_wrong_side=False, ignore_cancel=False):
-    """Run TWAP benchmark episodes.
-
-    Uses TWAP scheduling in the CLOB phase and the same auction-phase heuristic as the AS benchmark runner.
-    """
     bm_returns = []
     with benchmark_penalty_override(env, disable_wrong_side=ignore_wrong_side, disable_cancel=ignore_cancel):
 
@@ -1213,18 +1190,12 @@ class BenchmarkTrace:
 
 
 def _snap_clob_price(env, delta_ticks: float) -> float:
-    """Reproduce the environment's CLOB limit-price snapping for a sell order."""
     j_agent = int(max(0, min(int(env.Lc) - 1, math.floor(float(delta_ticks)))))
     k_mid = math.floor(float(env.mid_price) / float(env.alpha))
     return float(env.alpha) * float(k_mid + j_agent)
 
 
 def run_benchmark_episode_trace(env, policy, seed: int, name: str = "Benchmark") -> BenchmarkTrace:
-    """Run ONE episode using a benchmark policy and record inventory + submitted actions.
-
-    This mirrors the logic of run_glft_benchmark_episodes / run_twap_benchmark_episodes,
-    including the same auction-phase heuristic.
-    """
     tr = BenchmarkTrace(name=name)
 
     with benchmark_penalty_override(env, disable_wrong_side=False, disable_cancel=False):
@@ -1265,7 +1236,6 @@ def run_benchmark_episode_trace(env, policy, seed: int, name: str = "Benchmark")
             phase_before = getattr(env, "phase", "C")
 
             if phase_before in ("continuous", "C", "clob"):
-                # record pre-action state
                 t_now = float(getattr(env, "current_time", s.get('time', 0.0) if isinstance(s, dict) else 0.0))
                 inv_now = float(getattr(env, "inventory", s.get('X1', 0.0) if isinstance(s, dict) else 0.0))
                 mid_now = float(getattr(env, "mid_price", s.get('X10', 0.0) if isinstance(s, dict) else 0.0))
@@ -1273,13 +1243,11 @@ def run_benchmark_episode_trace(env, policy, seed: int, name: str = "Benchmark")
                 t_idx = _extract_time_index(s, env, policy)
                 a_idx = policy.choose_clob_action_index(s, t_idx, env=env)
 
-                # decode the discrete action
                 v, delta = policy.clob_actions[a_idx]
                 v = float(min(float(v), inv_now))
                 delta = float(delta)
                 price = _snap_clob_price(env, delta)
 
-                # step
                 if hasattr(env, "step_clob"):
                     s2, r, done, info = _step4(env, "step_clob", a_idx)
                 else:
@@ -1287,7 +1255,6 @@ def run_benchmark_episode_trace(env, policy, seed: int, name: str = "Benchmark")
 
                 cum_r += r
 
-                # log
                 tr.t.append(t_now)
                 tr.phase.append('C')
                 tr.mid.append(mid_now)
@@ -1303,7 +1270,6 @@ def run_benchmark_episode_trace(env, policy, seed: int, name: str = "Benchmark")
 
                 s = s2
 
-                # if transitioned to auction, apply the same opening heuristic as benchmark runner
                 phase_after = getattr(env, "phase", None)
                 if phase_after in ("auction", "A") and (not done):
                     q_left = float(getattr(env, "inventory", 0.0))
@@ -1317,7 +1283,6 @@ def run_benchmark_episode_trace(env, policy, seed: int, name: str = "Benchmark")
                             K_big = 10.0 * q_left
                             auct_action = (K_big, S_star, [0.0] * n)
 
-                            # record pre-action state at auction entry
                             t_now = float(getattr(env, "current_time", env.tau_op))
                             inv_now = float(getattr(env, "inventory", 0.0))
                             mid_now = float(getattr(env, "mid_price", 0.0))
@@ -1345,7 +1310,6 @@ def run_benchmark_episode_trace(env, policy, seed: int, name: str = "Benchmark")
                             s = s2
 
             elif phase_before in ("auction", "A"):
-                # auction follow-up actions (mirrors the existing benchmark runner)
                 if auct_action_open is None:
                     n = max(1, int(getattr(env, "auction_horizon", 1)))
                     auct_action_open = (0.0, float(getattr(env, "mid_price", 0.0)), [0.0] * n)
@@ -1375,14 +1339,12 @@ def run_benchmark_episode_trace(env, policy, seed: int, name: str = "Benchmark")
 
                 s = s2
             else:
-                # Unknown phase: stop
                 break
 
     return tr
 
 
 def plot_benchmark_traces(glft_tr: BenchmarkTrace, twap_tr: BenchmarkTrace, tau_op: int, tau_cl: int, ep_label: str = "", save_path: Optional[str] = None):
-    """Visualize benchmark behavior on one episode: inventory + submitted actions (price & volume) in CLOB and Auction."""
     import numpy as np
 
     def arr(x):
@@ -1393,7 +1355,6 @@ def plot_benchmark_traces(glft_tr: BenchmarkTrace, twap_tr: BenchmarkTrace, tau_
 
     fig, axs = plt.subplots(2, 2, figsize=(13, 8))
 
-    # --- Inventory ---
     axs[0, 0].plot(t_g, arr(glft_tr.inv), label=glft_tr.name)
     axs[0, 0].plot(t_w, arr(twap_tr.inv), label=twap_tr.name)
     axs[0, 0].axvline(tau_op, ls='--', lw=0.8, color='k')
@@ -1402,7 +1363,6 @@ def plot_benchmark_traces(glft_tr: BenchmarkTrace, twap_tr: BenchmarkTrace, tau_
     axs[0, 0].set_ylabel('Inventory')
     axs[0, 0].legend()
 
-    # --- CLOB submitted price ---
     mask_gC = np.array(glft_tr.phase) == 'C'
     mask_wC = np.array(twap_tr.phase) == 'C'
     axs[0, 1].plot(t_g[mask_gC], arr(glft_tr.clob_price)[mask_gC], label=f"{glft_tr.name} price")
@@ -1413,7 +1373,6 @@ def plot_benchmark_traces(glft_tr: BenchmarkTrace, twap_tr: BenchmarkTrace, tau_
     axs[0, 1].set_ylabel('Price')
     axs[0, 1].legend()
 
-    # --- CLOB submitted volume ---
     axs[1, 0].plot(t_g[mask_gC], arr(glft_tr.clob_v)[mask_gC], label=f"{glft_tr.name} volume")
     axs[1, 0].plot(t_w[mask_wC], arr(twap_tr.clob_v)[mask_wC], label=f"{twap_tr.name} volume")
     axs[1, 0].axvline(tau_op, ls='--', lw=0.8, color='k')
@@ -1422,26 +1381,21 @@ def plot_benchmark_traces(glft_tr: BenchmarkTrace, twap_tr: BenchmarkTrace, tau_
     axs[1, 0].set_ylabel('Volume')
     axs[1, 0].legend()
 
-    # --- Auction actions (S and K) ---
     mask_gA = np.array(glft_tr.phase) == 'A'
     mask_wA = np.array(twap_tr.phase) == 'A'
 
     ax = axs[1, 1]
         
-    # Plot only K on the main axis
     ax.plot(t_w[mask_wA], arr(twap_tr.auct_K)[mask_wA], label=f"{twap_tr.name} $K$ (auction)")
     ax.plot(t_g[mask_gA], arr(glft_tr.auct_K)[mask_gA], label=f"{glft_tr.name} $K$ (auction)")
     ax.set_ylabel('Auction intensity $K = 10 q_{\\tau^{\mathrm{op}}}$')
 
-    # Formatting
     ax.axvline(tau_op, ls='--', lw=0.8, color='k')
     ax.set_title('Auction submitted actions for TWAP benchmark')
     ax.set_xlabel('Time')
 
-    # Legend (simple now, no merging needed)
     ax.legend(loc='best', fontsize=9)
 
-    # Global Figure Formatting
     for ax_ in axs.flat:
         ax_.grid(True, alpha=0.25)
 
@@ -1551,14 +1505,12 @@ def nfq_fit_clob(clob_buffer, clob_net, clob_target, auct_target, opt, gamma, ms
     if N == 0:
         return np.nan
 
-    # Pack current dataset
-    xs = torch.stack([tr[0] for tr in clob_buffer]).to(DEVICE)  # (N, 8)
-    a  = torch.tensor([tr[1] for tr in clob_buffer], dtype=torch.long, device=DEVICE)  # (N,)
-    r  = torch.tensor([tr[2] for tr in clob_buffer], dtype=torch.float32, device=DEVICE)  # (N,)
-    d  = torch.tensor([1.0 if tr[3] else 0.0 for tr in clob_buffer], dtype=torch.float32, device=DEVICE)  # (N,)
+    xs = torch.stack([tr[0] for tr in clob_buffer]).to(DEVICE)
+    a  = torch.tensor([tr[1] for tr in clob_buffer], dtype=torch.long, device=DEVICE)
+    r  = torch.tensor([tr[2] for tr in clob_buffer], dtype=torch.float32, device=DEVICE)
+    d  = torch.tensor([1.0 if tr[3] else 0.0 for tr in clob_buffer], dtype=torch.float32, device=DEVICE)
     next_is_auct = torch.tensor([1.0 if tr[4] else 0.0 for tr in clob_buffer], dtype=torch.float32, device=DEVICE)
 
-    # Compute fitted targets using frozen targets (Q^k)
     with torch.no_grad():
         q_next = torch.zeros(N, device=DEVICE)
 
@@ -1567,17 +1519,16 @@ def nfq_fit_clob(clob_buffer, clob_net, clob_target, auct_target, opt, gamma, ms
 
         if idx_cont.any():
             cont_idx = idx_cont.nonzero(as_tuple=False).squeeze(1).tolist()
-            x2_cont = torch.stack([clob_buffer[i][5] for i in cont_idx]).to(DEVICE)  # (Nc, 8)
+            x2_cont = torch.stack([clob_buffer[i][5] for i in cont_idx]).to(DEVICE)
             q_next[idx_cont] = clob_target(x2_cont).max(dim=1)[0]
 
         if idx_auct.any():
             auct_idx = idx_auct.nonzero(as_tuple=False).squeeze(1).tolist()
-            x2_auct = torch.stack([clob_buffer[i][5] for i in auct_idx]).to(DEVICE)  # (Na, 7)
+            x2_auct = torch.stack([clob_buffer[i][5] for i in auct_idx]).to(DEVICE)
             q_next[idx_auct] = auct_target(x2_auct).max(dim=1)[0]
 
-        y = r + gamma * (1.0 - d) * q_next  # (N,)
+        y = r + gamma * (1.0 - d) * q_next
 
-    # Supervised regression: fit Q^{k+1}
     total_loss = 0.0
     total_count = 0
 
@@ -1606,11 +1557,11 @@ def nfq_fit_auction(auct_buffer, auct_net, auct_target, opt, gamma, mse,
     if N == 0:
         return np.nan
 
-    xs = torch.stack([tr[0] for tr in auct_buffer]).to(DEVICE)  # (N, 7)
+    xs = torch.stack([tr[0] for tr in auct_buffer]).to(DEVICE)
     a  = torch.tensor([tr[1] for tr in auct_buffer], dtype=torch.long, device=DEVICE)
     r  = torch.tensor([tr[2] for tr in auct_buffer], dtype=torch.float32, device=DEVICE)
     d  = torch.tensor([1.0 if tr[3] else 0.0 for tr in auct_buffer], dtype=torch.float32, device=DEVICE)
-    x2 = torch.stack([tr[4] for tr in auct_buffer]).to(DEVICE)  # (N, 7)
+    x2 = torch.stack([tr[4] for tr in auct_buffer]).to(DEVICE)
 
     with torch.no_grad():
         q_next = auct_target(x2).max(dim=1)[0]
@@ -1756,10 +1707,9 @@ for ep in range(EPISODES):
 
             s2, r, done = env.step((v, delta))
             
-            # Build next-state features in the correct space (depends on next phase)
             if done:
                 next_is_auct = False
-                x2_feat = feat_clob(s2, env)  # unused in target because done; any placeholder ok
+                x2_feat = feat_clob(s2, env)
             else:
                 if env.phase == 'continuous':
                     next_is_auct = False
@@ -1768,14 +1718,13 @@ for ep in range(EPISODES):
                     next_is_auct = True
                     x2_feat = feat_auction(s2, env)
 
-            # Store transition for NFQ
             clob_buffer.append((
-                x.squeeze(0).detach(),     # x_t (8,)
-                int(a_idx),                # action index
-                float(r * REWARD_SCALE),   # reward
-                bool(done),                # done
-                bool(next_is_auct),        # whether next phase is auction
-                x2_feat.detach()           # x_{t+1} in appropriate feature space
+                x.squeeze(0).detach(),
+                int(a_idx),
+                float(r * REWARD_SCALE),
+                bool(done),
+                bool(next_is_auct),
+                x2_feat.detach()
             ))
 
             if done:
@@ -1785,7 +1734,7 @@ for ep in range(EPISODES):
                     x2 = feat_clob(s2, env).unsqueeze(0)
                     with torch.no_grad():
                         q_next = clob_target(x2).max(dim=1)[0]
-                else:  # auction
+                else:
                     x2 = feat_auction(s2, env).unsqueeze(0)
                     with torch.no_grad():
                         q_next = auct_target(x2).max(dim=1)[0]
@@ -1815,15 +1764,14 @@ for ep in range(EPISODES):
 
             s2, r, done = env.step((K, S, c_vec))
             
-            # Next-state features (auction space)
-            x2_feat = feat_auction(s2, env) if not done else feat_auction(s2, env)  # placeholder ok when done
+            x2_feat = feat_auction(s2, env) if not done else feat_auction(s2, env)
 
             auct_buffer.append((
-                x.squeeze(0).detach(),       # x_t (7,)
+                x.squeeze(0).detach(),
                 int(a_idx),
                 float(r * REWARD_SCALE),
                 bool(done),
-                x2_feat.detach()             # x_{t+1} (7,)
+                x2_feat.detach()
             ))
 
             if env.phase == 'auction' and not done:
@@ -1865,7 +1813,6 @@ for ep in range(EPISODES):
 
         s = s2
     
-    # --- NFQ fitted iteration (Option A) ---
     if len(clob_buffer) >= MIN_BUFFER:
         if ep % 50 == 0:
             print(f"Episode {ep+1}/{EPISODES}")
@@ -1884,7 +1831,6 @@ for ep in range(EPISODES):
     else:
         auct_fit_loss = np.nan
 
-    # Hard update target nets: Q^k <- Q^{k+1}
     clob_target.load_state_dict(clob_net.state_dict())
     auct_target.load_state_dict(auct_net.state_dict())
 
@@ -2020,17 +1966,14 @@ glft.precompute()
 
 twap = TWAPBenchmark(glft_params, CLOB_ACTIONS, q_name_in_state="inv", twap_delta_ticks=None, delta_mode="min")
 
-# Visualize benchmark behavior on the LAST training episode (same seed as episode {EPISODES})
 
 try:
-    # Determine how many recent episodes to plot (up to 5)
     plot_count = 5
     start_idx = max(0, len(EPISODE_SEEDS) - plot_count)
     
-    # Iterate from the start_idx up to the end of the list
     for i in range(start_idx, len(EPISODE_SEEDS)):
         trace_seed = int(EPISODE_SEEDS[i])
-        ep_num = i + 1  # 1-based episode number for labeling
+        ep_num = i + 1
         
         glft_tr = run_benchmark_episode_trace(env, glft, trace_seed, name="AS")
         twap_tr = run_benchmark_episode_trace(env, twap, trace_seed, name="TWAP")
@@ -2041,24 +1984,20 @@ try:
 except Exception as e:
     print(f"[WARN] Failed to generate benchmark behavior plot: {e}")
 
-# Plot evaluation returns against theoretical benchmarks (AS + TWAP)
 glft_eval_returns = []
 twap_eval_returns = []
 for i in range(len(eval_returns)):
     if (i + 1) % EVAL_INTERVAL == 0:
-        # Get the episode indices for this evaluation point
         ep_end = i + 1
         ep_start = max(0, ep_end - N_EVAL_EPISODES)
         eval_ep_seeds = EPISODE_SEEDS[ep_start:ep_end]
 
-        # Run AS benchmark on these episodes
         glft_ret = run_glft_benchmark_episodes(
             env, glft, eval_ep_seeds,
             auction_actions=None,
             ignore_wrong_side=False,
             ignore_cancel=False
         )
-        # Run TWAP benchmark on these episodes
         twap_ret = run_twap_benchmark_episodes(
             env, twap, eval_ep_seeds,
             auction_actions=None,
@@ -2069,7 +2008,6 @@ for i in range(len(eval_returns)):
         glft_eval_returns.append(np.mean(glft_ret))
         twap_eval_returns.append(np.mean(twap_ret))
     else:
-        # Carry forward previous value
         glft_eval_returns.append(glft_eval_returns[-1] if glft_eval_returns else np.nan)
         twap_eval_returns.append(twap_eval_returns[-1] if twap_eval_returns else np.nan)
 
@@ -2087,7 +2025,6 @@ plt.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig("eval_returns_vs_benchmark.png")
 plt.show()
-
 
 # Regret analysis
 N = min(len(DQN_RETURNS), len(EPISODE_SEEDS))
@@ -2113,7 +2050,6 @@ plt.tight_layout()
 plt.savefig("dqn_vs_glft_regret.png")
 plt.show()
 
-
 # Episode-wise returns
 plt.figure(figsize=(7.0, 4.0))
 plt.plot(DQN_RETURNS, label="NFQ return", alpha=0.8)
@@ -2126,7 +2062,6 @@ plt.legend()
 plt.tight_layout()
 plt.savefig("dqn_vs_glft_returns.png")
 plt.show()
-
 
 # Trailing-window mean of returns
 N = min(len(DQN_RETURNS), len(glft_bm_returns), len(twap_bm_returns))
@@ -2239,7 +2174,6 @@ glft_stats = {
     'std_return': np.std(glft_results),
     'median_return': np.median(glft_results)
 }
-
 
 print("\n[2/4] Evaluating TWAP Benchmark...")
 twap_results = run_twap_benchmark_episodes(env, twap, FINAL_EVAL_SEEDS, auction_actions=None, ignore_wrong_side=False, ignore_cancel=False)
@@ -2369,7 +2303,6 @@ plt.tight_layout()
 plt.savefig("final_evaluation_comparison.png", dpi=150)
 plt.show()
 
-# Plot 3: Phase-wise reward breakdown (Final DQN only)
 fig, ax = plt.subplots(figsize=(10, 6))
 
 phase_labels = ['Continuous phase', 'Auction phase', 'Total']

@@ -23,8 +23,8 @@ from contextlib import contextmanager
 def load_mid_matrix_from_csv(
     csv_path: str,
     tickers=None,
-    start=None,          # can be None, row index (int), or datetime string
-    tau_cl: int = 150,    # total horizon in *minutes* (env steps)
+    start=None,
+    tau_cl: int = 150,
     normalize_start_100: bool = False,
 ):
     df = pd.read_csv(csv_path, parse_dates=["Datetime"]).sort_values("Datetime")
@@ -32,14 +32,12 @@ def load_mid_matrix_from_csv(
     if tickers is None:
         tickers = [c for c in df.columns if c != "Datetime"]
 
-    # pick start row
     if start is None:
         start_idx = 0
     elif isinstance(start, int):
         start_idx = start
     else:
         start_ts = pd.Timestamp(start)
-        # first row whose datetime >= start_ts
         start_idx = int(np.searchsorted(df["Datetime"].to_numpy(), start_ts.to_datetime64()))
 
     need = tau_cl + 1
@@ -47,7 +45,7 @@ def load_mid_matrix_from_csv(
     if len(win) < need:
         raise ValueError(f"Not enough rows: need {need}, have {len(win)} (start_idx={start_idx}).")
 
-    X = win[tickers].to_numpy(dtype=float).T  # shape: (n_assets, tau_cl+1)
+    X = win[tickers].to_numpy(dtype=float).T
     if normalize_start_100:
         X = X / X[:, [0]] * 100.0
 
@@ -139,14 +137,12 @@ class MarketEmulator:
     def _update_mid_price_from_path(self) -> None:
         if self.mid_price_path is None or len(self.mid_price_path) == 0:
             return
-        # time is float; your path is per-second. Use floor and clamp.
         idx = int(math.floor(self.current_time))
         idx = max(0, min(idx, len(self.mid_price_path) - 1))
         self.mid_price = float(self.mid_price_path[idx])
 
         
     def _refresh_order_book(self):
-        # Initialize exogenous order book limit order volumes 
         V1a = float(self.V_top_max * self.rng.beta(self.beta_a, self.beta_b))
         V1b = float(self.V_top_max * self.rng.beta(self.beta_a, self.beta_b))
         rho = self.depth_decay
@@ -163,7 +159,6 @@ class MarketEmulator:
     def reset(self, seed: Optional[int] = None):
         if seed is not None:
             self.set_seed(seed)
-        # Reset the environment when starting a new episode
         self.phase = 'continuous'
         self.current_time = 0.0
         self.inventory = float(self.I_max)
@@ -176,7 +171,6 @@ class MarketEmulator:
         else:
             self.mid_price = 100.0
         
-        # Baseline mid for feature normalization / diagnostics (per-episode)
         self.mid_price0 = float(self.mid_price)
         
         self.H_cl = self.mid_price
@@ -186,7 +180,6 @@ class MarketEmulator:
         if self.mid_price_path is None:
             self._reset_rough_heston_state()
         else:
-            # ensure RH state won't be used accidentally
             self._rh_initialized = False
 
         self._refresh_order_book() 
@@ -206,7 +199,6 @@ class MarketEmulator:
         return self._get_state()
     
     def _get_state(self):
-        # Define the state vector
         t = self.current_time
         in_continuous = (self.phase == 'continuous')
         in_auction = (self.phase == 'auction')
@@ -255,8 +247,6 @@ class MarketEmulator:
             X13 = [0.0] * self.Lc
             X14 = [0.0] * self.Lc
         B = 10
-        # k_mid = round(self.mid_price / self.alpha)
-        # price_grid = [self.alpha * (k_mid + i) for i in range(-B, B+1)]
         X15 = []
         if in_auction:
             for idx in range(self.La):
@@ -286,32 +276,27 @@ class MarketEmulator:
         }
         
     def _update_hyp_clearing_price_from_book(self):
-        # Implementation of algorithm 1 to predict the clearing price at time t
         eps = 1e-12
         tick_size = self.alpha
 
-        # Record standing limit orders after action of agent 
         k0 = int(round(self.mid_price / tick_size))
         vol_by_k = {}
 
-        # Ask levels
         for j in range(min(self.Lc, len(self.ask_volumes))):
             v = float(self.ask_volumes[j])
             if v > eps:
                 k = k0 + j
                 vol_by_k[k] = vol_by_k.get(k, 0.0) + v
 
-        # Bid levels
         for j in range(min(self.Lc, len(self.bid_volumes))):
             v = float(self.bid_volumes[j])
             if v > eps:
                 k = k0 - j
                 vol_by_k[k] = vol_by_k.get(k, 0.0) + v
                 
-        # Agent active order in continuous phase
         if self.agent_active_order_cont and self.agent_active_order_cont['volume'] > 1e-12:
             j = int(self.agent_active_order_cont['level'])
-            k = k0 + j # Agent is on the ask side
+            k = k0 + j
             vol_by_k[k] = vol_by_k.get(k, 0.0) + float(self.agent_active_order_cont['volume'])
 
         self._mom_count += 1
@@ -332,13 +317,11 @@ class MarketEmulator:
                 num += K_hat * (tick_size * k)
                 den += K_hat
 
-        # Do not update the hypothetical clearing price if denominator is zero i.e. no liquidity
         if den > 0.0:
             tilde_S = num / den
             self.H_cl = self.H_cl + self.gamma * (tilde_S - self.H_cl)
    
     def step(self, action):
-        # Define the environment step based on the current phase
 
         f = lambda x : x if x > 0 else 0
 
@@ -353,7 +336,6 @@ class MarketEmulator:
             self.agent_active_order_cont = None
             lam_step = self.poisson_rate * self.dt
 
-            # Clamp level delta into book price tick grid and snap price to tick
             j_agent = int(max(0, min(self.Lc - 1, math.floor(delta))))
             k_mid = math.floor(self.mid_price / self.alpha)
             agent_price = self.alpha * (k_mid + j_agent)
@@ -371,7 +353,6 @@ class MarketEmulator:
             next_sell_time = last_time + self.rng.exponential(scale=1.0 / lam_step)
 
             def process_buy_order(volume):
-                # Variable is the volume of buy market order arriving
                 nonlocal executed_vol
                 remain = float(volume)
 
@@ -386,7 +367,6 @@ class MarketEmulator:
                     self.ask_volumes[j] -= take
                     remain -= take
 
-                # Agent has execution priority on his level
                 if remain > 0 and self.agent_active_order_cont and j_agent < self.Lc:
                     vol_agent = self.agent_active_order_cont['volume']
                     take = min(remain, vol_agent)
@@ -424,7 +404,6 @@ class MarketEmulator:
                     self.bid_volumes[j] -= take
                     remain -= take
             
-            # Theoretical time grid implementation
             last_time = self.current_time
             tau_plus  = next_buy_time
             tau_minus = next_sell_time
@@ -434,7 +413,6 @@ class MarketEmulator:
 
             target_time = min(max(t_i, tau_i), self.tau_op - 1.0)
 
-            # Simulate events up to the decision time
             while min(next_buy_time, next_sell_time) <= target_time:
                 if next_buy_time <= next_sell_time:
                     current_time = next_buy_time
@@ -444,29 +422,25 @@ class MarketEmulator:
                     current_time = next_sell_time
                     process_sell_order(volume=self._sample_mo_volume())
                     next_sell_time = current_time + self.rng.exponential(scale=1.0 / lam_step)
-            # Update order book depths after processing events
             self.depth_ask = next((j+1 for j,v in enumerate(self.ask_volumes) if v <= 1e-6), self.Lc)
             self.depth_bid = next((j+1 for j,v in enumerate(self.bid_volumes) if v <= 1e-6), self.Lc)
             
             self._update_hyp_clearing_price_from_book()
 
-            # Compute one-step reward
             S_submit = agent_price
             E_t = executed_vol
             reward = S_submit * E_t * f(1 - self.kappa * f(self.H_cl - S_submit))
             
-            # Track sold prices for theoretical benchmark policy
             if E_t > 0.0:
                 self.clob_sell_prices.append(float(S_submit))
                 if (self.clob_sold_max_price is None) or (float(S_submit) > self.clob_sold_max_price):
                     self.clob_sold_max_price = float(S_submit)
 
-            # Update state variables
             self.last_executed = E_t
             self.inventory = float(np.clip(self.inventory, -self.I_max, self.I_max))
 
-            dt = max(0.0, target_time - last_time)   # usually 1.0
-            dt_phys  = dt * self.dt                  # seconds
+            dt = max(0.0, target_time - last_time)
+            dt_phys  = dt * self.dt
 
             self.current_time = float(target_time)
             self.last_action_time = self.current_time
@@ -478,7 +452,6 @@ class MarketEmulator:
 
             self.next_decision_time = self.current_time + dt
 
-            # Transition to auction phase if time is up
             done = False
             if self.current_time >= self.tau_op - 1:
                 self.phase = 'auction'
@@ -546,7 +519,6 @@ class MarketEmulator:
                 self.agent_orders_S[t] = S_a
                 self.agent_order_active[t] = True
 
-            # Update hypothetical clearing price at time t according to equation (2)
             total_slope = 0.0
             total_intercept_term = 0.0
             for (K_i, S_i) in self.active_supply:
@@ -567,7 +539,6 @@ class MarketEmulator:
             else:
                 self.H_cl = self.mid_price
 
-            # Compute one-step reward
             if isinstance(c_t, (list, tuple)):
                 cancel_count = sum(1 for s in range(self.tau_op, t) if s < len(c_t) and c_t[s] == 1)
             reward = K_a * self.H_cl * (self.H_cl - S_a) - self.q * f(- K_a * self.H_cl *(self.H_cl - S_a)) - self.d * cancel_count
@@ -797,14 +768,7 @@ class ASBenchmark:
 
 
 class TWAPBenchmark:
-    """TWAP liquidation benchmark during the continuous/CLOB phase.
 
-    At each CLOB decision time t:
-      - compute steps_left = T - t + 1
-      - target volume ≈ ceil(q / steps_left), capped by remaining inventory
-      - submit at a fixed delta (in ticks) snapped to the discrete action grid
-    The auction phase uses the same heuristic as the AS benchmark runner.
-    """
 
     def __init__(
         self,
@@ -812,7 +776,7 @@ class TWAPBenchmark:
         clob_actions,
         q_name_in_state: str = "inv",
         twap_delta_ticks: 'Optional[float]' = None,
-        delta_mode: str = "min",  # "min" (more aggressive) or "max" (more passive) if twap_delta_ticks is None
+        delta_mode: str = "min",
     ):
         self.p = params
         self.clob_actions = list(clob_actions)
@@ -824,7 +788,6 @@ class TWAPBenchmark:
 
         self.delta_grid = np.array([a[1] for _, a in self.allowed_clob], dtype=float)
 
-        # choose TWAP delta from grid
         if twap_delta_ticks is not None:
             d = float(twap_delta_ticks)
             j = int(np.argmin(np.abs(self.delta_grid - d)))
@@ -876,12 +839,10 @@ class TWAPBenchmark:
     def choose_clob_action_index(self, s, t_idx, env=None):
         q = self._state_get_inventory(s, env=env)
 
-        # If no inventory, prefer explicit (0,·) action if present
         if q <= 0:
             for i, a in enumerate(self.clob_actions):
                 if a[0] == 0:
                     return i
-            # fallback: widest delta among allowed (least likely to execute)
             i, _ = max(self.allowed_clob, key=lambda p: p[1][1])
             return i
 
@@ -891,7 +852,6 @@ class TWAPBenchmark:
         target_vol = int(math.ceil(q / float(steps_left)))
         target_vol = max(1, min(target_vol, q))
 
-        # prefer actions at the TWAP delta
         tol = 1e-12
         same_delta = [(i, a) for i, a in self.allowed_clob if abs(float(a[1]) - float(self.twap_delta)) <= tol]
         if not same_delta:
@@ -910,7 +870,6 @@ class TWAPBenchmark:
         return int(idx)
 
 def run_twap_benchmark_episodes(env, twap: TWAPBenchmark, episode_seeds, auction_actions=None, ignore_wrong_side=False, ignore_cancel=False):
-    """Run TWAP benchmark episodes with the same auction heuristic as AS."""
     bm_returns = []
     with benchmark_penalty_override(env, disable_wrong_side=ignore_wrong_side, disable_cancel=ignore_cancel):
 
@@ -1050,7 +1009,6 @@ def run_glft_benchmark_episodes(env, glft: ASBenchmark, episode_seeds, auction_a
                 phase_before = getattr(env, "phase", "C")
 
                 if phase_before in ("continuous", "C", "clob"):
-                    # Use real time-based index
                     t_idx = _extract_time_index(s, env, glft)
                     a_idx = glft.choose_clob_action_index(s, t_idx, env=env)
 
@@ -1104,9 +1062,6 @@ def run_glft_benchmark_episodes(env, glft: ASBenchmark, episode_seeds, auction_a
 
 DEVICE = torch.device("cpu")
 
-
-# Feature extraction for computations
-# Feature extraction for computations
 def feat_clob(s, env):
     I_max, Lc, Vmax = env.I_max, env.Lc, env.V_max
     t_norm = (s['time'] / max(1.0, (env.tau_op - 1))) if s['time'] <= env.tau_op - 1 else 1.0
@@ -1146,14 +1101,13 @@ def nfq_fit_clob(clob_buffer, clob_net, clob_target, auct_target, opt, gamma, ms
     if N == 0:
         return np.nan
 
-    # Pack current dataset
-    xs = torch.stack([tr[0] for tr in clob_buffer]).to(DEVICE)  # (N, 8)
-    a  = torch.tensor([tr[1] for tr in clob_buffer], dtype=torch.long, device=DEVICE)  # (N,)
-    r  = torch.tensor([tr[2] for tr in clob_buffer], dtype=torch.float32, device=DEVICE)  # (N,)
-    d  = torch.tensor([1.0 if tr[3] else 0.0 for tr in clob_buffer], dtype=torch.float32, device=DEVICE)  # (N,)
+    xs = torch.stack([tr[0] for tr in clob_buffer]).to(DEVICE)
+    a  = torch.tensor([tr[1] for tr in clob_buffer], dtype=torch.long, device=DEVICE)
+    r  = torch.tensor([tr[2] for tr in clob_buffer], dtype=torch.float32, device=DEVICE)
+    d  = torch.tensor([1.0 if tr[3] else 0.0 for tr in clob_buffer], dtype=torch.float32, device=DEVICE)
     next_is_auct = torch.tensor([1.0 if tr[4] else 0.0 for tr in clob_buffer], dtype=torch.float32, device=DEVICE)
 
-    # Compute fitted targets using frozen targets (Q^k)
+    
     with torch.no_grad():
         q_next = torch.zeros(N, device=DEVICE)
 
@@ -1162,17 +1116,17 @@ def nfq_fit_clob(clob_buffer, clob_net, clob_target, auct_target, opt, gamma, ms
 
         if idx_cont.any():
             cont_idx = idx_cont.nonzero(as_tuple=False).squeeze(1).tolist()
-            x2_cont = torch.stack([clob_buffer[i][5] for i in cont_idx]).to(DEVICE)  # (Nc, 8)
+            x2_cont = torch.stack([clob_buffer[i][5] for i in cont_idx]).to(DEVICE)
             q_next[idx_cont] = clob_target(x2_cont).max(dim=1)[0]
 
         if idx_auct.any():
             auct_idx = idx_auct.nonzero(as_tuple=False).squeeze(1).tolist()
-            x2_auct = torch.stack([clob_buffer[i][5] for i in auct_idx]).to(DEVICE)  # (Na, 7)
+            x2_auct = torch.stack([clob_buffer[i][5] for i in auct_idx]).to(DEVICE)
             q_next[idx_auct] = auct_target(x2_auct).max(dim=1)[0]
 
-        y = r + gamma * (1.0 - d) * q_next  # (N,)
+        y = r + gamma * (1.0 - d) * q_next
 
-    # Supervised regression: fit Q^{k+1}
+    
     total_loss = 0.0
     total_count = 0
 
@@ -1201,11 +1155,11 @@ def nfq_fit_auction(auct_buffer, auct_net, auct_target, opt, gamma, mse,
     if N == 0:
         return np.nan
 
-    xs = torch.stack([tr[0] for tr in auct_buffer]).to(DEVICE)  # (N, 7)
+    xs = torch.stack([tr[0] for tr in auct_buffer]).to(DEVICE)
     a  = torch.tensor([tr[1] for tr in auct_buffer], dtype=torch.long, device=DEVICE)
     r  = torch.tensor([tr[2] for tr in auct_buffer], dtype=torch.float32, device=DEVICE)
     d  = torch.tensor([1.0 if tr[3] else 0.0 for tr in auct_buffer], dtype=torch.float32, device=DEVICE)
-    x2 = torch.stack([tr[4] for tr in auct_buffer]).to(DEVICE)  # (N, 7)
+    x2 = torch.stack([tr[4] for tr in auct_buffer]).to(DEVICE)
 
     with torch.no_grad():
         q_next = auct_target(x2).max(dim=1)[0]
@@ -1384,9 +1338,7 @@ def evaluate_policy(env, clob_net, auct_net, eval_seeds, clob_actions, auct_acti
     }
     
 def soft_update(local_model, target_model, tau=0.01):
-    """Soft update model parameters.
-    θ_target = τ*θ_local + (1 - τ)*θ_target
-    """
+
     for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
         target_param.data.copy_(tau*local_param.data + (1.0-tau)*target_param.data)
 
@@ -1417,7 +1369,6 @@ def train_and_evaluate_one_asset(
 ) -> dict:
     os.makedirs(out_dir, exist_ok=True)
 
-    # ---- mid path: validate + optional normalization ----
     mid_path = np.asarray(mid_path, dtype=float)
     if len(mid_path) < 2:
         raise ValueError(f"{symbol}: mid_path must have length >= 2")
@@ -1425,16 +1376,13 @@ def train_and_evaluate_one_asset(
         mid_path = 100.0 * mid_path / mid_path[0]
 
     if len(mid_path) != tau_op:
-        # safest choice: enforce consistency
         raise ValueError(f"{symbol}: len(mid_path)={len(mid_path)} must equal tau_op={tau_op}")
 
-    # ---- deterministic initialization per asset (nets/init only) ----
     random.seed(master_seed)
     np.random.seed(master_seed)
     torch.manual_seed(master_seed)
     policy_rng = random.Random(master_seed)
 
-    # ---- build env (NO rough Heston args) ----
     env = MarketEmulator(
         tau_op=tau_op, tau_cl=tau_cl, T=T,
         I=100, V=30, L=12, Lc=12, La=12,
@@ -1460,7 +1408,6 @@ def train_and_evaluate_one_asset(
     S_OFFSETS = np.arange(-12, 13, dtype=int)
     auct_actions = [(float(K), float(off), int(cancel)) for K in K_CHOICES for off in S_OFFSETS for cancel in (0, 1)]
 
-    # ---- networks + targets ----
     clob_net = DQN(in_dim=8, out_dim=len(clob_actions)).to(DEVICE)
     auct_net = DQN(in_dim=7, out_dim=len(auct_actions)).to(DEVICE)
     clob_target = DQN(in_dim=8, out_dim=len(clob_actions)).to(DEVICE)
@@ -1480,7 +1427,6 @@ def train_and_evaluate_one_asset(
     clob_buffer = deque(maxlen=buffer_size)
     auct_buffer = deque(maxlen=buffer_size)
 
-    # ---- epsilon schedule (make it local so it uses `episodes`) ----
     def epsilon_by_episode(ep, start=1.0, end=0.01, total=episodes, warmup=100):
         if total <= 1:
             return end
@@ -1489,7 +1435,6 @@ def train_and_evaluate_one_asset(
         decay_rate = math.log(start / end) / max(1, (total - warmup))
         return start * math.exp(-decay_rate * (ep - warmup))
 
-    # ---- seeds per asset (use same across assets for fairness) ----
     rng_train = np.random.default_rng(master_seed)
     EPISODE_SEEDS = rng_train.integers(0, 2**32 - 1, size=episodes, dtype=np.uint32).tolist()
 
@@ -1499,13 +1444,11 @@ def train_and_evaluate_one_asset(
     rng_final = np.random.default_rng(final_eval_master_seed)
     FINAL_EVAL_SEEDS = rng_final.integers(0, 2**32 - 1, size=n_final_eval_episodes, dtype=np.uint32).tolist()
 
-    # ---- training stats ----
     dqn_returns = []
     eval_returns = []
     clob_loss_per_ep = []
     auct_loss_per_ep = []
 
-    # ---- TRAIN ----
     for ep in range(episodes):
         seed = int(EPISODE_SEEDS[ep])
         eps = float(epsilon_by_episode(ep))
@@ -1528,7 +1471,7 @@ def train_and_evaluate_one_asset(
                 s2, r, done = env.step((v, delta))
                 next_is_auct = (env.phase != 'continuous')
 
-                # next feature depends on next phase
+                
                 x2_feat = feat_auction(s2, env) if next_is_auct else feat_clob(s2, env)
 
                 clob_buffer.append((
@@ -1540,7 +1483,7 @@ def train_and_evaluate_one_asset(
                     x2_feat.detach()
                 ))
 
-            else:  # auction
+            else:
                 x = feat_auction(s, env).unsqueeze(0)
                 with torch.no_grad():
                     q_vals = auct_net(x)[0]
@@ -1573,9 +1516,9 @@ def train_and_evaluate_one_asset(
 
         dqn_returns.append(float(cum_r))
 
-        # NFQ updates
+        
         if len(clob_buffer) >= min_buffer:
-            # use your existing nfq_fit_clob signature
+            
             loss_c = nfq_fit_clob(
                 clob_buffer, clob_net, clob_target, auct_target,
                 opt_clob, gamma, mse, batch_size=batch_size, epochs=nfq_epochs
@@ -1594,37 +1537,19 @@ def train_and_evaluate_one_asset(
         clob_target.load_state_dict(clob_net.state_dict())
         auct_target.load_state_dict(auct_net.state_dict())
 
-        # ---- Evaluation ----
-        if (ep + 1) % eval_interval == 0:
-            # Note: For eval, we usually pass the UN-SCALED reward or raw environment
-            # But the agent relies on its trained Q values.
-            # We run the eval loop to get "true" returns (unscaled).
-            eval_seeds_subset = rng_train.integers(0, 10000, size=n_eval_episodes).tolist()
-            eval_r = float(np.mean([
-                run_eval_episode(env, clob_net, auct_net, clob_actions, auct_actions, seed=int(sd))
-                for sd in eval_seeds_subset
-            ]))
-            eval_returns.append(eval_r)
-            print(f"Episode {ep+1}/{episodes} | Eval Return: {eval_r:.2f} | Epsilon: {eps:.3f}")
-
         clob_loss_per_ep.append(loss_c)
         auct_loss_per_ep.append(loss_a)
 
-        # update targets (your code currently does it every episode)
-        soft_update(clob_net, clob_target, tau=0.01)
-        soft_update(auct_net, auct_target, tau=0.01)
-
-        # periodic greedy eval
         if (ep + 1) % eval_interval == 0:
             eval_r = float(np.mean([
                 run_eval_episode(env, clob_net, auct_net, clob_actions, auct_actions, seed=int(sd))
                 for sd in EVAL_SEEDS
             ]))
             eval_returns.append(eval_r)
+            print(f"Episode {ep+1}/{episodes} | Eval Return: {eval_r:.2f} | Epsilon: {eps:.3f}")
         else:
             eval_returns.append(eval_returns[-1] if len(eval_returns) else np.nan)
 
-    # ---- AS calibration from THIS realized path ----
     p = np.asarray(env.mid_price_path, dtype=float)
     r = np.diff(np.log(p))
     AS_sigma = float(np.std(r, ddof=1)) / math.sqrt(float(env.dt))
@@ -1651,10 +1576,8 @@ def train_and_evaluate_one_asset(
     glft = ASBenchmark(glft_params, clob_actions, q_name_in_state="inv")
     glft.precompute()
 
-    # ---- TWAP benchmark (CLOB TWAP + same auction heuristic) ----
     twap = TWAPBenchmark(glft_params, clob_actions, q_name_in_state="inv", twap_delta_ticks=None, delta_mode="min")
 
-    # ---- FINAL EVAL: AS vs Final DQN vs Initial DQN ----
     glft_results = run_glft_benchmark_episodes(
         env, glft, FINAL_EVAL_SEEDS,
         auction_actions=None,
@@ -1674,7 +1597,6 @@ def train_and_evaluate_one_asset(
     final_stats = evaluate_policy(env, clob_net, auct_net, FINAL_EVAL_SEEDS, clob_actions, auct_actions, "Final DQN")
     final_mean = float(final_stats["mean_return"])
 
-    # initial (untrained) nets
     initial_clob = DQN(in_dim=8, out_dim=len(clob_actions)).to(DEVICE)
     initial_auct = DQN(in_dim=7, out_dim=len(auct_actions)).to(DEVICE)
     initial_clob.load_state_dict(initial_clob_state); initial_clob.eval()
@@ -1686,9 +1608,8 @@ def train_and_evaluate_one_asset(
     improvement_final_minus_twap = final_mean - twap_mean
     twap_minus_glft = twap_mean - glft_mean
 
-    # ---- optional per-asset plots (IMPORTANT: unique filenames) ----
     if make_plots:
-        # Example: trailing eval return plot
+        
         plt.figure(figsize=(7, 4))
         plt.plot(eval_returns, label="DQN eval mean return")
         plt.title(f"{symbol} - DQN eval return (every {eval_interval} eps)")
@@ -1716,20 +1637,18 @@ if __name__ == "__main__":
     import pandas as pd
     import numpy as np
 
-    CSV_PATH = "data.csv"  # put the file next to this script or set full path
+    CSV_PATH = "data.csv"
 
-    # Your new time setup (1 step = 1 minute)
-    tau_op = 120   # 120 minutes of continuous phase
-    tau_cl = 150   # total horizon minutes (includes 30 minutes auction)
+    tau_op = 120
+    tau_cl = 150
     T = tau_cl
 
     # SYMBOLS = ["AAPL", "MSFT", "AMZN", "GOOGL", "JPM", "XOM", "JNJ", "PG", "CAT", "NEE"]
     SYMBOLS = ["MSFT", "JPM", "PG", "GOOGL", "CAT"]
-    START_ROW = 0  # change this to slide the 60-min window forward
+    START_ROW = 0
 
     df = pd.read_csv(CSV_PATH, parse_dates=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
 
-    # sanity
     missing = [s for s in SYMBOLS if s not in df.columns]
     if missing:
         raise ValueError(f"Missing columns in CSV: {missing}. Found: {list(df.columns)}")
@@ -1737,7 +1656,6 @@ if __name__ == "__main__":
     if START_ROW + tau_op > len(df):
         raise ValueError(f"Not enough rows: need START_ROW+tau_op <= {len(df)}")
 
-    # build mid_paths dict: each path is length tau_op (=60)
     mid_paths = {
         sym: df[sym].to_numpy(dtype=float)[START_ROW:START_ROW + tau_op]
         for sym in SYMBOLS
